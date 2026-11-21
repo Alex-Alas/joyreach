@@ -12,6 +12,7 @@ use bevy::light::atmosphere::ScatteringMedium;
 use bevy::light::{Atmosphere, CascadeShadowConfigBuilder, SunDisk, light_consts::lux};
 use bevy::prelude::*;
 
+use crate::grab::{Grabbable, OutlineMaterials, spawn_outlines};
 use crate::theme;
 
 /// Half extent of the walkable deck. The player is clamped a little inside this.
@@ -124,6 +125,10 @@ fn setup_world(
         ..default()
     });
 
+    // Grab outlines: one shared unlit material per hand colour (DESIGN §8).
+    let outlines = OutlineMaterials::new(&mut materials);
+    commands.insert_resource(outlines.clone());
+
     // --- Deck: a thin slab plus 30 m long planks with 4 cm seams ---------------
     commands.spawn((
         Mesh3d(meshes.add(Cuboid::new(30.0, 0.33, 30.0))),
@@ -231,6 +236,7 @@ fn setup_world(
             stone.clone(),
             charcoal.clone(),
         ],
+        &outlines,
     );
 
     // --- Crate stack to the right of the bench -------------------------------
@@ -240,15 +246,19 @@ fn setup_world(
         (Vec3::new(1.05, 0.512, -1.02), 0.04),
         (Vec3::new(1.42, 0.172, -1.24), -0.05),
     ] {
-        commands.spawn((
-            Mesh3d(crate_mesh.clone()),
-            MeshMaterial3d(crate_wood.clone()),
-            Transform::from_translation(pos).with_rotation(Quat::from_rotation_y(yaw)),
-            RigidBody::Dynamic,
-            Collider::cuboid(0.34, 0.34, 0.34),
-            Friction::new(0.85),
-            Restitution::new(0.05),
-        ));
+        let crate_entity = commands
+            .spawn((
+                Mesh3d(crate_mesh.clone()),
+                MeshMaterial3d(crate_wood.clone()),
+                Transform::from_translation(pos).with_rotation(Quat::from_rotation_y(yaw)),
+                RigidBody::Dynamic,
+                Collider::cuboid(0.34, 0.34, 0.34),
+                Friction::new(0.85),
+                Restitution::new(0.05),
+                Grabbable,
+            ))
+            .id();
+        spawn_outlines(&mut commands, crate_entity, crate_mesh.clone(), 0.17, &outlines);
     }
 
     // --- Three large light balls on the deck ---------------------------------
@@ -258,15 +268,19 @@ fn setup_world(
         (Vec3::new(0.88, 0.262, -1.80), stone.clone()),
         (Vec3::new(0.1, 0.262, -2.42), mustard.clone()),
     ] {
-        commands.spawn((
-            Mesh3d(ball_mesh.clone()),
-            MeshMaterial3d(material),
-            Transform::from_translation(pos),
-            RigidBody::Dynamic,
-            Collider::sphere(0.26),
-            Friction::new(0.6),
-            Restitution::new(0.25),
-        ));
+        let ball_entity = commands
+            .spawn((
+                Mesh3d(ball_mesh.clone()),
+                MeshMaterial3d(material),
+                Transform::from_translation(pos),
+                RigidBody::Dynamic,
+                Collider::sphere(0.26),
+                Friction::new(0.6),
+                Restitution::new(0.25),
+                Grabbable,
+            ))
+            .id();
+        spawn_outlines(&mut commands, ball_entity, ball_mesh.clone(), 0.26, &outlines);
     }
 
     // --- Planters with clipped shrubs, far enough to give the horizon scale ---
@@ -297,6 +311,7 @@ fn spawn_bench_props(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     [mustard, sage, plum, stone, charcoal]: [Handle<StandardMaterial>; 5],
+    outlines: &OutlineMaterials,
 ) {
     let surface = BENCH_TOP_Y + 0.004;
 
@@ -416,15 +431,19 @@ fn spawn_bench_props(
     for (x, z, half_h, mesh, collider, material) in props {
         // A deterministic tilt keeps the props from reading as a dev grid.
         let yaw = (x * 7.3 + z * 5.1).sin() * 0.7;
-        commands.spawn((
-            Mesh3d(mesh),
-            MeshMaterial3d(material),
-            Transform::from_xyz(x, surface + half_h, z)
-                .with_rotation(Quat::from_rotation_y(yaw)),
-            RigidBody::Dynamic,
-            collider,
-            Friction::new(0.65),
-            Restitution::new(0.18),
-        ));
+        let entity = commands
+            .spawn((
+                Mesh3d(mesh.clone()),
+                MeshMaterial3d(material),
+                Transform::from_xyz(x, surface + half_h, z)
+                    .with_rotation(Quat::from_rotation_y(yaw)),
+                RigidBody::Dynamic,
+                collider,
+                Friction::new(0.65),
+                Restitution::new(0.18),
+                Grabbable,
+            ))
+            .id();
+        spawn_outlines(commands, entity, mesh, half_h, outlines);
     }
 }

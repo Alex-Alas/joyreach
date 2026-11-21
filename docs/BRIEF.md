@@ -44,7 +44,7 @@ Fuente: `googlevr/gvr-unity-sdk/.../ArmModel/GvrArmModel.cs` (Apache-2.0). Mano 
 
 1. Brazos en espacio de cuerpo, siguen el yaw del cuerpo, no el pitch de la cámara. FOV ~80°.
 2. Lag mínimo: sin suavizado global; si hace falta, smoothing por tiers (JibbSmart) solo en movimientos pequeños.
-3. Manos físicas (M1): cuerpo dinámico que persigue al objetivo por velocidad; agarre = joint con límite de fuerza (250–500 N), el objeto resbala si se excede. Lanzar = velocidad promedio de la mano en los últimos ~5 frames.
+3. Manos físicas (M1): cuerpo dinámico que persigue al objetivo por velocidad; agarre = seguimiento con límite de fuerza (400 N), el objeto resbala si se excede. Lanzar = velocidad promedio de la mano en los últimos ~5 frames × 1.6 (máx. 12 m/s).
 4. Dedos que se cierran con el gatillo (~80 ms): vende el agarre sin costo.
 5. Recentrado siempre disponible (−/+).
 6. Escalada tipo Gorilla Tag (M2): mano agarrada a geometría estática mueve el cuerpo en sentido opuesto.
@@ -52,7 +52,7 @@ Fuente: `googlevr/gvr-unity-sdk/.../ArmModel/GvrArmModel.cs` (Apache-2.0). Mano 
 ## Hitos
 
 - **M0 — brazos vivos:** escena, cámara con sticks, brazos siguiendo los Joy-Con, empujar objetos físicos. Probe `examples/joycon_probe.rs`.
-- **M1 — agarrar y lanzar** con ZL/ZR.
+- **M1 — agarrar y lanzar** con ZL/ZR, contorno del color de la mano, HD Rumble, torso que se inclina. `src/grab.rs`.
 - **M2 — locomoción:** saltar, escalar, flotar.
 - **M3 — ventana de escritorio** capturada (WGC) en un panel 3D, con puntero desde la mano.
 - **M4 — navegador** embebido (CEF) interactivo.

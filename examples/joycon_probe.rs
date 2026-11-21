@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! cargo run --example joycon_probe -- --secs 8
+//! cargo run --example joycon_probe -- --secs 4 --rumble   # left then right, 300 ms each
 //! ```
 //!
 //! Prints, ~10 times per second, for each hand: connection/topology/gamepad type, enabled SDL
@@ -16,11 +17,11 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 
 use bevy::math::Vec3;
-use joycon::{HandDebug, HandInput, JoyConWorker};
+use joycon::{HandDebug, HandInput, JoyConWorker, RumbleHand};
 
 fn main() {
-    let secs = match parse_args() {
-        Ok(secs) => secs,
+    let (secs, rumble) = match parse_args() {
+        Ok(args) => args,
         Err(message) => {
             eprintln!("{message}");
             print_usage();
@@ -36,9 +37,13 @@ fn main() {
     );
     println!("(Sensors only exist once SDL's HIDAPI Switch driver takes the device; SDL errors are \
              reported below.)");
+    if rumble {
+        println!("(Rumble test: left Joy-Con at 0.6 s, right Joy-Con at 1.2 s, 300 ms each.)");
+    }
 
     let start = Instant::now();
     let mut frame: u64 = 0;
+    let mut rumble_stage = 0_u8;
     while start.elapsed().as_secs_f64() < secs {
         let hands = worker.snapshot();
         let debug = worker.debug_snapshot();
@@ -51,6 +56,17 @@ fn main() {
         print_hand("RIGHT", &hands.right, &debug.right);
         let _ = std::io::stdout().flush();
 
+        // Pulse left, then right, so the user can feel which physical Joy-Con buzzes.
+        let elapsed = start.elapsed().as_secs_f64();
+        if rumble && rumble_stage == 0 && elapsed > 0.6 {
+            print_rumble(&worker, RumbleHand::Left);
+            rumble_stage = 1;
+        }
+        if rumble && rumble_stage == 1 && elapsed > 1.2 {
+            print_rumble(&worker, RumbleHand::Right);
+            rumble_stage = 2;
+        }
+
         frame += 1;
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -60,8 +76,23 @@ fn main() {
     println!("\nprobe finished after {:.1} s", start.elapsed().as_secs_f64());
 }
 
-fn parse_args() -> Result<f64, String> {
+fn print_rumble(worker: &JoyConWorker, hand: RumbleHand) {
+    let label = match hand {
+        RumbleHand::Left => "left",
+        RumbleHand::Right => "right",
+    };
+    match worker.rumble_checked(hand, 0.8, 300) {
+        Ok(true) => println!("[rumble] {label}: SDL_RumbleGamepad -> true (300 ms, strength 0.8)"),
+        Ok(false) => println!(
+            "[rumble] {label}: SDL_RumbleGamepad -> false (no connected pad accepted it; see the SDL notes above)"
+        ),
+        Err(message) => println!("[rumble] {label}: queued but no reply ({message})"),
+    }
+}
+
+fn parse_args() -> Result<(f64, bool), String> {
     let mut secs = 10.0_f64;
+    let mut rumble = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -76,6 +107,7 @@ fn parse_args() -> Result<f64, String> {
                     return Err("--secs must be a positive number".to_string());
                 }
             }
+            "--rumble" | "-r" => rumble = true,
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -83,11 +115,11 @@ fn parse_args() -> Result<f64, String> {
             other => return Err(format!("unknown argument: {other}")),
         }
     }
-    Ok(secs)
+    Ok((secs, rumble))
 }
 
 fn print_usage() {
-    println!("usage: joycon_probe [--secs N]   (default N = 10)");
+    println!("usage: joycon_probe [--secs N] [--rumble]   (default N = 10)");
 }
 
 fn print_hand(label: &str, hand: &HandInput, debug: &HandDebug) {

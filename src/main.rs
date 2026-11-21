@@ -5,6 +5,7 @@
 //! - `JOYREACH_FAKE=1`: drive both hands with animated fake input (no hardware).
 
 mod arms;
+mod grab;
 mod hud;
 mod joycon;
 mod player;
@@ -43,6 +44,7 @@ fn main() {
         world::WorldPlugin,
         player::PlayerPlugin,
         arms::ArmsPlugin,
+        grab::GrabPlugin,
         hud::HudPlugin,
         joycon::JoyConPlugin,
     ))
@@ -72,6 +74,10 @@ fn main() {
 /// Animated stand-in for the Joy-Con so the arms can be checked without hardware.
 /// Also mirrored into [`FakeHands`] because the fixed-step physics reads input
 /// before `Update` runs and would otherwise never see the fake state.
+///
+/// Script (so `--screenshot` at ~4 s catches a real grab):
+/// 0–1.5 s slow wave; 1.5–6 s both hands settle over the bench, the right one grabs
+/// a prop at 2.2 s; afterwards release and wave again.
 fn fake_hands(mut hands: ResMut<Hands>, mut fake: ResMut<FakeHands>, time: Res<Time>) {
     let t = time.elapsed_secs();
     for index in 0..2 {
@@ -92,8 +98,26 @@ fn fake_hands(mut hands: ResMut<Hands>, mut fake: ResMut<FakeHands>, time: Res<T
         let roll = 20.0_f32.to_radians() * (t * 0.9 + phase * 1.3).sin();
         hand.orientation = Quat::from_euler(EulerRot::YXZ, yaw, pitch, roll);
 
-        // Triggers toggle every 1.5 s, offset per hand, to check the finger curl.
-        hand.trigger = ((t + index as f32 * 0.75) / 1.5) as i64 % 2 == 0;
+        // Trigger stays open during the wave phase so the demo prop is untouched.
+        hand.trigger = false;
+
+        if (1.5..6.0).contains(&t) {
+            // Bench demo: hands turned in over the props, palm down-ish. The right
+            // hand closes on the stone cylinder at 2.2 s and holds it for the shot.
+            let side_yaw: f32 = if index == 0 { 0.0 } else { -25.0 };
+            let micro = ((t * 1.3 + phase).sin() * 1.5).to_radians();
+            hand.orientation = Quat::from_euler(
+                EulerRot::YXZ,
+                (side_yaw.to_radians()) + micro,
+                5.0_f32.to_radians(),
+                0.0,
+            );
+            hand.trigger = index == 1 && t > 2.2;
+        } else if t >= 6.0 {
+            // Release at 6 s (the throw tick) and keep waving.
+            hand.trigger = ((t - 6.0 + index as f32 * 0.75) / 1.5) as i64 % 2 == 0;
+        }
+
         hand.shoulder = false;
         hand.face = [false; 4];
         hand.stick = Vec2::ZERO;

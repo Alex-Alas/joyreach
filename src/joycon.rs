@@ -23,8 +23,9 @@
 
 use std::ffi::CStr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use bevy::math::EulerRot;
 use bevy::prelude::*;
@@ -77,6 +78,47 @@ impl Default for HandInput {
 pub struct Hands {
     pub left: HandInput,
     pub right: HandInput,
+}
+
+// ---------------------------------------------------------------------------------------------
+// HD Rumble (additive: gameplay writes `Rumble` messages, the SDL thread does the call)
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RumbleHand {
+    Left,
+    Right,
+}
+
+impl RumbleHand {
+    fn index(self) -> usize {
+        match self {
+            RumbleHand::Left => 0,
+            RumbleHand::Right => 1,
+        }
+    }
+}
+
+/// A vibration pulse request. `strength` is 0..1, `ms` is the duration.
+///
+/// Mapping (verified in SDL 3.4.20): a combined Joy-Con pair exposes two HIDAPI children.
+/// `SDL_hidapi_combined.c:109-120` forwards the same `low`/`high` pair to both children,
+/// and `SDL_hidapi_switch.c:1783-1790` zeroes `high` for the left child and `low` for the
+/// right one. So for a combined pad, low frequency = left Joy-Con, high = right Joy-Con.
+/// A lone Joy-Con pad (no parent) gets both amplitudes on its two actuators.
+#[derive(Message, Clone, Copy, Debug)]
+pub struct Rumble {
+    pub hand: RumbleHand,
+    pub strength: f32,
+    pub ms: u32,
+}
+
+struct RumbleCommand {
+    hand: RumbleHand,
+    strength: f32,
+    ms: u32,
+    /// Set by the probe to report whether the actual SDL call succeeded.
+    ack: Option<mpsc::Sender<bool>>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -181,12 +223,21 @@ impl Plugin for JoyConPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Hands>();
         app.insert_resource(JoyConWorker::spawn());
+        app.add_message::<Rumble>();
         app.add_systems(PreUpdate, copy_hands_into_resource);
+        app.add_systems(Update, forward_rumble);
     }
 }
 
 fn copy_hands_into_resource(worker: Res<JoyConWorker>, mut hands: ResMut<Hands>) {
     *hands = worker.snapshot();
+}
+
+/// Turns gameplay `Rumble` messages into commands for the SDL thread.
+fn forward_rumble(worker: Res<JoyConWorker>, mut messages: MessageReader<Rumble>) {
+    for message in messages.read() {
+        worker.rumble(message.hand, message.strength, message.ms);
+    }
 }
 
 /// Handle to the SDL thread. Dropping it asks the thread to stop and joins it (this happens when
@@ -197,6 +248,7 @@ pub struct JoyConWorker {
     hands: Arc<Mutex<Hands>>,
     debug: Arc<Mutex<Diagnostics>>,
     stop: Arc<AtomicBool>,
+    rumble_tx: mpsc::Sender<RumbleCommand>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -205,6 +257,7 @@ impl JoyConWorker {
         let hands = Arc::new(Mutex::new(Hands::default()));
         let debug = Arc::new(Mutex::new(Diagnostics::default()));
         let stop = Arc::new(AtomicBool::new(false));
+        let (rumble_tx, rumble_rx) = mpsc::channel::<RumbleCommand>();
 
         let thread = {
             let hands = Arc::clone(&hands);
@@ -212,7 +265,7 @@ impl JoyConWorker {
             let stop = Arc::clone(&stop);
             std::thread::Builder::new()
                 .name("joycon-sdl".to_string())
-                .spawn(move || sdl_thread_main(hands, debug, stop))
+                .spawn(move || sdl_thread_main(hands, debug, stop, rumble_rx))
                 .map_err(|e| eprintln!("[joycon] could not spawn SDL thread: {e}"))
                 .ok()
         };
@@ -221,6 +274,7 @@ impl JoyConWorker {
             hands,
             debug,
             stop,
+            rumble_tx,
             thread,
         }
     }
@@ -234,6 +288,34 @@ impl JoyConWorker {
     #[allow(dead_code)] // used by examples/joycon_probe.rs
     pub fn debug_snapshot(&self) -> Diagnostics {
         lock(&self.debug).clone()
+    }
+
+    /// Queue a rumble pulse. Fire-and-forget: returns false only if the SDL thread is gone.
+    pub fn rumble(&self, hand: RumbleHand, strength: f32, ms: u32) -> bool {
+        self.rumble_tx
+            .send(RumbleCommand {
+                hand,
+                strength,
+                ms,
+                ack: None,
+            })
+            .is_ok()
+    }
+
+    /// Queue a pulse and wait for the SDL call result (for the probe / diagnostics).
+    #[allow(dead_code)] // used by examples/joycon_probe.rs
+    pub fn rumble_checked(&self, hand: RumbleHand, strength: f32, ms: u32) -> Result<bool, String> {
+        let (tx, rx) = mpsc::channel();
+        self.rumble_tx
+            .send(RumbleCommand {
+                hand,
+                strength,
+                ms,
+                ack: Some(tx),
+            })
+            .map_err(|_| "SDL thread is not running".to_string())?;
+        rx.recv_timeout(Duration::from_millis(500))
+            .map_err(|_| "no reply from the SDL thread".to_string())
     }
 
     /// Ask the SDL thread to exit (idempotent; `Drop` does this too).
@@ -265,7 +347,12 @@ const POLL_TIMEOUT_MS: i32 = 4;
 /// Publish the (allocating) diagnostics snapshot every N loop iterations (~30 Hz).
 const DEBUG_EVERY_N: u32 = 8;
 
-fn sdl_thread_main(hands: Arc<Mutex<Hands>>, debug: Arc<Mutex<Diagnostics>>, stop: Arc<AtomicBool>) {
+fn sdl_thread_main(
+    hands: Arc<Mutex<Hands>>,
+    debug: Arc<Mutex<Diagnostics>>,
+    stop: Arc<AtomicBool>,
+    rumble_rx: mpsc::Receiver<RumbleCommand>,
+) {
     // Hints must be set before SDL_Init so the HIDAPI device enumeration already sees them.
     unsafe {
         // Static SDL build: make sure the HIDAPI drivers are on regardless of platform defaults.
@@ -318,6 +405,7 @@ fn sdl_thread_main(hands: Arc<Mutex<Hands>>, debug: Arc<Mutex<Diagnostics>>, sto
 
     let mut event: SDL_Event = unsafe { std::mem::zeroed() };
     let mut frame: u32 = 0;
+    let mut rumble_state = RumbleState::default();
 
     while !stop.load(Ordering::Relaxed) {
         let got_event = unsafe { SDL_WaitEventTimeout(&mut event, POLL_TIMEOUT_MS) };
@@ -343,6 +431,33 @@ fn sdl_thread_main(hands: Arc<Mutex<Hands>>, debug: Arc<Mutex<Diagnostics>>, sto
             for rt in pads.iter_mut().flat_map(|p| [p.left.as_mut(), p.right.as_mut()]).flatten() {
                 rt.fusion.recenter();
                 rt.input.orientation = rt.fusion.orientation();
+            }
+        }
+
+        // Rumble: commands set a per-hand pulse, then the owning pad gets the amplitudes
+        // immediately (with the ack of the real SDL call, for the probe).
+        while let Ok(command) = rumble_rx.try_recv() {
+            let now = Instant::now();
+            let amplitude = (command.strength.clamp(0.0, 1.0) * u16::MAX as f32) as u16;
+            rumble_state.set(
+                command.hand,
+                amplitude,
+                now + Duration::from_millis(command.ms.max(1) as u64),
+            );
+            let mut ok = false;
+            for pad in pads.iter_mut().filter(|pad| pad.owns(command.hand)) {
+                ok |= send_pad_rumble(pad, &rumble_state, now);
+            }
+            if let Some(ack) = command.ack {
+                let _ = ack.send(ok);
+            }
+        }
+        // Expired pulses: send zero to that pad once.
+        let now = Instant::now();
+        for pad in &mut pads {
+            let (low, high, _) = pad_rumble_levels(pad, &rumble_state, now);
+            if (low, high) != pad.last_rumble {
+                send_pad_rumble(pad, &rumble_state, now);
             }
         }
 
@@ -425,7 +540,92 @@ struct Pad {
     notes: Vec<String>,
     left: Option<HandRuntime>,
     right: Option<HandRuntime>,
+    /// Last low/high amplitudes sent, to only call SDL when they change.
+    last_rumble: (u16, u16),
+    /// Print at most one "rumble failed" line per pad.
+    rumble_warned: bool,
 }
+
+impl Pad {
+    fn owns(&self, hand: RumbleHand) -> bool {
+        match hand {
+            RumbleHand::Left => self.left.is_some(),
+            RumbleHand::Right => self.right.is_some(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RumblePulse {
+    amplitude: u16,
+    until: Option<Instant>,
+}
+
+#[derive(Debug, Default)]
+struct RumbleState {
+    pulses: [RumblePulse; 2],
+}
+
+impl RumbleState {
+    fn set(&mut self, hand: RumbleHand, amplitude: u16, until: Instant) {
+        self.pulses[hand.index()] = RumblePulse {
+            amplitude,
+            until: Some(until),
+        };
+    }
+
+    fn level(&self, hand: RumbleHand, now: Instant) -> u16 {
+        match self.pulses[hand.index()].until {
+            Some(until) if until > now => self.pulses[hand.index()].amplitude,
+            _ => 0,
+        }
+    }
+
+    fn remaining_ms(&self, hand: RumbleHand, now: Instant) -> u32 {
+        match self.pulses[hand.index()].until {
+            Some(until) if until > now => (until - now).as_millis().max(1) as u32,
+            _ => 0,
+        }
+    }
+}
+
+/// The amplitudes to send to one pad, and how long they should last.
+/// See [`Rumble`] for the combined-pair channel mapping.
+fn pad_rumble_levels(pad: &Pad, state: &RumbleState, now: Instant) -> (u16, u16, u32) {
+    let left = state.level(RumbleHand::Left, now);
+    let right = state.level(RumbleHand::Right, now);
+    let (low, high) = match pad.kind {
+        PadKind::Combined => (left, right),
+        // A lone Joy-Con has no per-hand split inside SDL: drive both actuators.
+        PadKind::Left => (left, left),
+        PadKind::Right => (right, right),
+    };
+    let ms = state
+        .remaining_ms(RumbleHand::Left, now)
+        .max(state.remaining_ms(RumbleHand::Right, now));
+    (low, high, ms)
+}
+
+fn send_pad_rumble(pad: &mut Pad, state: &RumbleState, now: Instant) -> bool {
+    let (low, high, remaining_ms) = pad_rumble_levels(pad, state, now);
+    let duration = if low == 0 && high == 0 {
+        0
+    } else {
+        remaining_ms.max(1)
+    };
+    let ok = unsafe { SDL_RumbleGamepad(pad.ptr, low, high, duration) };
+    if !ok && !pad.rumble_warned {
+        pad.rumble_warned = true;
+        eprintln!(
+            "[joycon] rumble failed on {}: {}",
+            pad.gamepad_name,
+            sdl_error()
+        );
+    }
+    pad.last_rumble = (low, high);
+    ok
+}
+
 
 /// Per-hand state that lives next to its pad (so unplugging the pad unplugs its hands).
 struct HandRuntime {
@@ -513,6 +713,8 @@ fn open_joycon(id: SDL_JoystickID) -> Option<Pad> {
             notes: Vec::new(),
             left: (kind != PadKind::Right).then(HandRuntime::new),
             right: (kind != PadKind::Left).then(HandRuntime::new),
+            last_rumble: (0, 0),
+            rumble_warned: false,
         };
 
         enable_pad_sensors(&mut pad);

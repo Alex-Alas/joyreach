@@ -14,7 +14,7 @@ use avian3d::prelude::*;
 use bevy::prelude::*;
 
 use crate::joycon::{HandInput, Hands};
-use crate::player::{EYE_HEIGHT, PlayerBody, PlayerSet};
+use crate::player::{EYE_HEIGHT, PlayerBody, PlayerRig, PlayerSet};
 use crate::theme;
 
 // --- GvrArmModel constants (converted to Bevy space) -------------------------
@@ -40,6 +40,20 @@ const ARM_EXTENSION_OFFSET: Vec3 = Vec3::new(-0.13, 0.14, -0.08);
 /// Kept nearly in the eye plane: pushing the chain forward would put the
 /// shoulders in front of the camera, which looks enormous and wrong.
 pub const ARM_ANCHOR_OFFSET: Vec3 = Vec3::new(0.0, 0.07, -0.04);
+
+/// Torso lean: looking down past this angle starts moving the arm roots forward and
+/// down, so the hands reach where the camera looks (DESIGN §7, M1 reach).
+pub const LEAN_START: f32 = 20.0_f32.to_radians();
+pub const LEAN_RANGE: f32 = 40.0_f32.to_radians();
+/// Offset of the whole arm chain at full lean (forward is −Z).
+pub const LEAN_OFFSET: Vec3 = Vec3::new(0.0, -0.35, -0.25);
+/// Smoothing time constant for the lean.
+pub const LEAN_TAU: f32 = 0.1;
+
+/// Collision layer bits for the hands, used by grab to stop a held prop colliding
+/// with the hand that holds it.
+pub const HAND_LAYER_LEFT: u32 = 1 << 1;
+pub const HAND_LAYER_RIGHT: u32 = 1 << 2;
 
 const UPPER_RADIUS: f32 = 0.052;
 const FOREARM_RADIUS: f32 = 0.036;
@@ -151,16 +165,46 @@ pub fn solve_arm(side: HandSide, orientation: Quat) -> ArmPose {
     }
 }
 
+/// How far the torso leans for a camera pitch (radians, negative = looking down).
+/// 0 while looking level or up; grows linearly from −20° to full lean at −60°.
+pub fn lean_ratio(pitch: f32) -> f32 {
+    ((-pitch - LEAN_START) / LEAN_RANGE).clamp(0.0, 1.0)
+}
+
+/// Body-space offset of the arm-chain anchor for a camera pitch.
+pub fn lean_offset(pitch: f32) -> Vec3 {
+    LEAN_OFFSET * lean_ratio(pitch)
+}
+
+/// Smoothed lean, shared by the visual arms (`Update`) and the hand bodies (`FixedUpdate`).
+#[derive(Resource, Default)]
+pub struct ArmLean {
+    pub offset: Vec3,
+}
+
 // --- ECS ---------------------------------------------------------------------
 
 pub struct ArmsPlugin;
 
 impl Plugin for ArmsPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, setup_arms.after(crate::player::spawn_player))
-            .add_systems(Update, update_arms.after(PlayerSet))
-            .add_systems(FixedUpdate, drive_hand_bodies);
+        app.init_resource::<ArmLean>()
+            .init_resource::<HandMotion>()
+            .add_systems(Startup, setup_arms.after(crate::player::spawn_player))
+            .add_systems(Update, (update_lean, update_arms).chain().after(PlayerSet))
+            .add_systems(FixedUpdate, drive_hand_bodies.in_set(HandBodiesSet));
     }
+}
+
+/// Hand bodies are driven before anything that follows the hands (grab).
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct HandBodiesSet;
+
+/// Latest hand velocities (from the fixed step), for throw and impact rumble.
+#[derive(Resource, Default)]
+pub struct HandMotion {
+    pub velocity: [Vec3; 2],
+    pub angular_velocity: [Vec3; 2],
 }
 
 #[derive(Component)]
@@ -199,9 +243,10 @@ struct SleevePart {
     muted: Handle<StandardMaterial>,
 }
 
+/// A hand's kinematic collider / palm point. Public so grab can query the palms.
 #[derive(Component)]
-struct HandBody {
-    side: HandSide,
+pub struct HandBody {
+    pub side: HandSide,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -370,6 +415,10 @@ fn setup_arms(
     for side in [HandSide::Left, HandSide::Right] {
         let rest = solve_arm(side, Quat::IDENTITY);
         let position = Vec3::Y * EYE_HEIGHT + ARM_ANCHOR_OFFSET + rest.hand;
+        let layer = match side {
+            HandSide::Left => HAND_LAYER_LEFT,
+            HandSide::Right => HAND_LAYER_RIGHT,
+        };
         commands.spawn((
             HandBody { side },
             Transform::from_translation(position).with_rotation(rest.hand_rotation),
@@ -377,12 +426,33 @@ fn setup_arms(
             Rotation(rest.hand_rotation),
             RigidBody::Kinematic,
             Collider::cuboid(0.10, 0.045, 0.12),
+            // Own layer so a held prop can ignore exactly this hand.
+            CollisionLayers::new(LayerMask(layer), LayerMask::ALL),
+            // Collision-start events feed the impact rumble.
+            CollisionEventsEnabled,
             Friction::new(0.9),
             Restitution::new(0.0),
             SleepingDisabled,
             LinearVelocity::default(),
             AngularVelocity::default(),
         ));
+    }
+}
+
+fn update_lean(
+    time: Res<Time>,
+    rig: Res<PlayerRig>,
+    mut lean: ResMut<ArmLean>,
+    mut roots: Query<&mut Transform, With<ArmRoot>>,
+) {
+    let target = lean_offset(rig.pitch);
+    let blend = 1.0 - (-time.delta_secs() / LEAN_TAU).exp();
+    lean.offset = lean.offset.lerp(target, blend);
+
+    // Torso lean moves the whole chain (shoulders included) with the camera pitch.
+    let translation = Vec3::Y * EYE_HEIGHT + ARM_ANCHOR_OFFSET + lean.offset;
+    for mut transform in &mut roots {
+        transform.translation = translation;
     }
 }
 
@@ -506,7 +576,9 @@ fn segment(transform: &mut Transform, from: Vec3, to: Vec3, radius: f32) {
 fn drive_hand_bodies(
     time: Res<Time<Fixed>>,
     hands: Res<Hands>,
+    lean: Res<ArmLean>,
     fake: Option<Res<crate::FakeHands>>,
+    mut motion: ResMut<HandMotion>,
     body: Single<&Transform, With<PlayerBody>>,
     mut hands_query: Query<(
         &HandBody,
@@ -534,7 +606,7 @@ fn drive_hand_bodies(
         let pose = solve_arm(hand.side, orientation);
 
         let target_position =
-            body.transform_point(Vec3::Y * EYE_HEIGHT + ARM_ANCHOR_OFFSET + pose.hand);
+            body.transform_point(Vec3::Y * EYE_HEIGHT + ARM_ANCHOR_OFFSET + lean.offset + pose.hand);
         let target_rotation = body.rotation * pose.hand_rotation;
 
         // Drive by velocity, never by teleporting: props receive real momentum.
@@ -546,11 +618,15 @@ fn drive_hand_bodies(
             delta = -delta;
         }
         let (axis, angle) = delta.to_axis_angle();
-        angular.0 = if angle > 1e-5 {
+        let angular_velocity = if angle > 1e-5 {
             axis * (angle / dt).min(30.0)
         } else {
             Vec3::ZERO
         };
+        angular.0 = angular_velocity;
+
+        motion.velocity[hand.side.index()] = velocity;
+        motion.angular_velocity[hand.side.index()] = angular_velocity;
     }
 }
 
@@ -673,5 +749,33 @@ mod tests {
             (0.0..0.06).contains(&clearance),
             "pitching -45° should bring the palm to within ~6 cm of the top, got {clearance} m"
         );
+    }
+
+    #[test]
+    fn lean_starts_at_twenty_degrees_below_and_is_zero_at_level() {
+        assert_eq!(lean_offset(0.0), Vec3::ZERO);
+        assert_eq!(lean_offset(20.0_f32.to_radians()), Vec3::ZERO);
+        assert!(lean_offset(-10.0_f32.to_radians()).length() < 1e-6);
+        assert!((lean_offset(-60.0_f32.to_radians()) - LEAN_OFFSET).length() < 1e-5);
+        // Clamped past −60°.
+        assert_eq!(lean_ratio(-89.0_f32.to_radians()), 1.0);
+        assert!((lean_offset(-30.0_f32.to_radians()) - LEAN_OFFSET * 0.25).length() < 1e-5);
+    }
+
+
+    #[test]
+    fn leaning_down_puts_the_neutral_palm_below_the_bench_top() {
+        use crate::world::BENCH_TOP_Y;
+
+        let hand = hand_world_space(solve_arm(HandSide::Right, Quat::IDENTITY))
+            + lean_offset(-60.0_f32.to_radians());
+        assert!(
+            hand.y < BENCH_TOP_Y,
+            "full lean should reach below the bench top: y = {}",
+            hand.y
+        );
+        // And further forward than the neutral hover, so low floor props are reachable.
+        let neutral = hand_world_space(solve_arm(HandSide::Right, Quat::IDENTITY));
+        assert!(hand.z < neutral.z - 0.2);
     }
 }

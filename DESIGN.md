@@ -64,20 +64,23 @@ Escala humana real (metros). Props de 8–15 cm: del tamaño de algo que agarras
 - Mangas: cápsulas con el color `joy.*` mate (roughness ~0.6). Antebrazo más delgado que el brazo superior.
 - Manos: guante `glove` mate, palma + 4 dedos + pulgar. Formas redondeadas, como el propio Joy-Con: nada de aristas vivas.
 - **Gatillo = puño:** los dedos se cierran en ~80 ms con ease-out; al soltar, se abren en ~120 ms. Es la confirmación visual del agarre.
+- **Alcance:** mirar por debajo de −20° inclina el torso (hombros y manos bajan 35 cm y avanzan 25 cm, suavizado ~100 ms) para llegar a lo que muestra la cámara. A 0° el desplazamiento es cero.
 - Desconectado: el brazo queda en reposo y la manga baja a 50 % de saturación. Sin mensajes de error en el mundo.
 - Cerca de la cámara: fade de la mano (no atravesar la cara).
 
 ## 8. Contorno de agarre
 
 - Prop dentro del radio de agarre (~12 cm de la palma) → contorno de 2 px en `joy.left`/`joy.right` según la mano. Si ambas manos lo alcanzan, gana la más cercana.
+- Técnica: casco invertido (copia del mesh 4 mm más grande, caras traseras, material sin luz). El grosor es constante en todos los props, no un %.
 - Agarrado: contorno sólido. Al soltar/lanzar, desaparece en 150 ms.
 - Un solo contorno por mano a la vez.
 
 ## 9. Retroalimentación (háptica y sonido)
 
 Los Joy-Con tienen HD Rumble (SDL `SDL_RumbleGamepad`); úsalo como canal principal, no como adorno.
-- Tocar un prop: pulso ∝ velocidad de impacto (10–40 ms).
+- Tocar un prop: pulso ∝ velocidad de impacto (10–40 ms, con 120 ms de enfriamiento por mano).
 - Agarrar: pulso firme de 40 ms. Lanzar: tick de 15 ms.
+- En un par combinado, SDL separa los dos Joy-Con por frecuencia: graves = izquierda, agudos = derecha (`SDL_hidapi_switch.c:1783-1790` + `SDL_hidapi_combined.c:109-120`). Un Joy-Con suelto usa ambos actuadores.
 - Sonido: golpes cortos de madera/goma según material del prop. Sin música en M0.
 
 ## 10. HUD
