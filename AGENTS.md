@@ -17,8 +17,11 @@ Rust + Bevy 0.20 + avian3d 0.8 desktop demo: two Joy-Cons drive virtual arms on 
 
 ## Runtime switches (verify features without hardware)
 - `JOYREACH_FAKE=1`: animated fake hands. The demo script times a grab so the screenshot catches it.
-- `cargo run -- --screenshot <path>`: saves a frame at ~4 s and exits.
-  - It captures black 3D (HUD only) if the window is occluded or launched via `Start-Process`. Run the exe directly in the foreground and pixel-check the result.
+- `cargo run -- --screenshot <path>`: saves a frame after 10 s (`JOYREACH_SHOT_SECS` overrides) and exits.
+  - Meshes only draw once their pipelines finish compiling in the background. An early capture shows sky + flat ground with half the scene missing; that is loading, not a render bug. Don't "fix" it by removing features.
+  - It also captures black 3D (HUD only) if the window is occluded or launched via `Start-Process`. Run it in the foreground and pixel-check the result.
+- `JOYREACH_VIEW=behind|front|side`: starting camera view (screenshots of the avatar). `JOYREACH_CAM=0` disables the camera feed; `JOYREACH_CAM="<dshow name>"` picks a device.
+- Don't capture the user's whole desktop to verify windows: it exposes their other apps.
 - `JOYREACH_PITCH=<deg>`: initial camera pitch (e.g. −70 to show the auto-crouch).
 - `JOYREACH_REACH=0|1`: forces IMU hand depth off/on. Default: on only when an accel calibration file exists.
 - Probe:
@@ -38,7 +41,9 @@ Rust + Bevy 0.20 + avian3d 0.8 desktop demo: two Joy-Cons drive virtual arms on 
 - `src/joycon.rs`: the SDL3 thread is the only hardware access. It publishes the `Hands` resource (`HandInput`: orientation, buttons, `reach`). It also contains `ImuFusion` (Mahony + variance-based gyro bias), `ReachTracker` (dead reckoning), calibration, and `Rumble` messages back to SDL.
 - `src/arms.rs`: port of Daydream `GvrArmModel` (orientation → elbow/wrist) + two-bone IK for `reach`. Hands are kinematic avian bodies chasing targets by velocity, so pushes impart momentum.
 - `src/player.rs`: kinematic capsule via avian `move_and_slide`. The arm rig origin is offset by `eye_height − EYE_HEIGHT`, so crouch moves the arms.
-- `src/grab.rs`: direct hand grab and throw. `src/handray.rs`: palm ray, reusable as the window pointer in a later milestone.
+- `src/grab.rs`: direct hand grab and throw, plus beam hold: distance, L/R + stick spin, `PropMode` physics on release. `BeamStatus` tells player.rs when a stick rotates a prop instead of moving/looking. `src/handray.rs`: palm ray with aim assist (8° cone + line-of-sight check), reusable as the window pointer in a later milestone.
+- `src/views.rs`: camera view modes. Avatar head/torso and the full upper arms are on render layer 1 (`AVATAR_LAYER`); the first-person camera draws layer 0 only.
+- `src/webcam.rs`: camera via the `ffmpeg` CLI piped into a borderless `ffplay` window (a separate window, not a Bevy texture). Recording goes to `recordings/` (gitignored). Children are stopped with `q` in `Drop` so MP4s finalise.
 - Design decision: Joy-Cons are trustworthy for orientation, not position. Depth from the IMU must stay bounded (clamp, ZUPT, slow return) and must not double-count motion the arm model already explains.
 
 ## Conventions

@@ -299,7 +299,16 @@ fn grab_cursor(
     }
 }
 
-fn look_with_hands(hands: Res<Hands>, time: Res<Time>, mut rig: ResMut<PlayerRig>) {
+fn look_with_hands(
+    hands: Res<Hands>,
+    beam: Res<crate::grab::BeamStatus>,
+    time: Res<Time>,
+    mut rig: ResMut<PlayerRig>,
+) {
+    // R + right stick rotates a beam-held prop instead of turning the camera.
+    if beam.hands[1].rotating {
+        return;
+    }
     let stick = hands.right.stick;
     // Quadratic response: small deflections stay precise, full tilt turns fast.
     let x = stick.x * stick.x.abs();
@@ -405,6 +414,7 @@ fn ease_eye_height(time: Res<Time>, mut rig: ResMut<PlayerRig>) {
 fn move_player(
     time: Res<Time>,
     hands: Res<Hands>,
+    beam: Res<crate::grab::BeamStatus>,
     keys: Res<ButtonInput<KeyCode>>,
     spatial_query: SpatialQuery,
     move_and_slide: MoveAndSlide,
@@ -446,7 +456,12 @@ fn move_player(
     };
 
     // --- Horizontal intent ---------------------------------------------------
-    let stick = hands.left.stick;
+    // L + left stick rotates a beam-held prop instead of walking.
+    let stick = if beam.hands[0].rotating {
+        Vec2::ZERO
+    } else {
+        hands.left.stick
+    };
     let mut input = Vec2::new(stick.x, stick.y);
 
     let mut keyboard = Vec2::ZERO;
@@ -574,6 +589,7 @@ fn move_player(
 
 fn write_player_transform(
     rig: Res<PlayerRig>,
+    views: Res<crate::views::Views>,
     mut body: Single<&mut Transform, (With<PlayerBody>, Without<PlayerCamera>)>,
     mut camera: Single<&mut Transform, (With<PlayerCamera>, Without<PlayerBody>)>,
 ) {
@@ -582,8 +598,8 @@ fn write_player_transform(
     body.translation = rig.position + Vec3::Y * (rig.eye_height - EYE_HEIGHT);
     body.rotation = Quat::from_rotation_y(rig.yaw);
 
-    camera.translation = Vec3::new(0.0, EYE_HEIGHT, 0.0);
-    camera.rotation = Quat::from_rotation_x(rig.pitch);
+    // First person by default; `V` / Home moves the camera outside to watch the arms.
+    **camera = crate::views::camera_local(views.mode, rig.pitch);
 }
 
 #[cfg(test)]

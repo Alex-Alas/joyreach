@@ -51,6 +51,8 @@ pub struct HandInput {
     pub stick_click: bool,
     /// Minus (left) / Plus (right).
     pub menu: bool,
+    /// Capture (left) / Home (right).
+    pub extra: bool,
     /// Calibrated gyro (rad/s) and accel (m/s^2) in body space, for gestures/debug.
     pub gyro: Vec3,
     pub accel: Vec3,
@@ -83,6 +85,7 @@ impl Default for HandInput {
             face: [false; 4],
             stick_click: false,
             menu: false,
+            extra: false,
             gyro: Vec3::ZERO,
             accel: Vec3::ZERO,
             reach: Vec3::ZERO,
@@ -1699,6 +1702,14 @@ unsafe fn poll_pad(pad: &mut Pad) -> bool {
             rt.input.trigger = SDL_GetGamepadAxis(gp, btn_trigger) > (32767 / 2) as i16;
             rt.input.shoulder = SDL_GetGamepadButton(gp, btn_shoulder);
             rt.input.stick_click = SDL_GetGamepadButton(gp, btn_stick);
+            // Capture is SDL's MISC1 on the left Joy-Con; Home is GUIDE on the right one.
+            rt.input.extra = SDL_GetGamepadButton(
+                gp,
+                match hand {
+                    Hand::Left => SDL_GAMEPAD_BUTTON_MISC1,
+                    Hand::Right => SDL_GAMEPAD_BUTTON_GUIDE,
+                },
+            );
 
             let menu = SDL_GetGamepadButton(gp, btn_menu);
             // Minus / Plus: yaw-only recenter, pitch/roll stay absolute.

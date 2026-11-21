@@ -12,6 +12,8 @@ mod hud;
 mod joycon;
 mod player;
 mod theme;
+mod views;
+mod webcam;
 mod world;
 
 use bevy::prelude::*;
@@ -58,6 +60,8 @@ fn main() {
         handray::HandRayPlugin,
         grab::GrabPlugin,
         hud::HudPlugin,
+        views::ViewsPlugin,
+        webcam::WebcamPlugin,
         joycon::JoyConPlugin,
     ))
     // Fixed 120 Hz: the hands are kinematic bodies driven by velocity, so a
@@ -194,7 +198,14 @@ fn take_screenshot(
         return;
     }
     request.timer += time.delta_secs();
-    if request.timer < 4.0 {
+    // Shaders/pipelines compile in the background and a mesh is only drawn once its pipeline is
+    // ready, so an early capture can show the sky with half the scene missing. Default 10 s;
+    // `JOYREACH_SHOT_SECS` overrides it.
+    let wait = std::env::var("JOYREACH_SHOT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<f32>().ok())
+        .unwrap_or(10.0);
+    if request.timer < wait {
         return;
     }
     request.requested = true;

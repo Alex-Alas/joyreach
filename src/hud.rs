@@ -31,6 +31,8 @@ struct HudText(HudTextKind);
 enum HudTextKind {
     Fps,
     Hz(HandSide),
+    /// Beam status while this hand holds a prop with the beam (mode, rotating).
+    Beam(HandSide),
 }
 
 #[derive(Component)]
@@ -109,6 +111,12 @@ fn setup_hud(mut commands: Commands, asset_server: Res<AssetServer>) {
             TextColor(theme::INK),
             HudText(HudTextKind::Hz(HandSide::Left)),
         ));
+        panel.spawn((
+            Text::new(""),
+            body_font.clone(),
+            TextColor(theme::INK),
+            HudText(HudTextKind::Beam(HandSide::Left)),
+        ));
     });
 
     commands
@@ -151,10 +159,17 @@ fn setup_hud(mut commands: Commands, asset_server: Res<AssetServer>) {
             ));
             panel.spawn((
                 Text::new("—"),
-                body_font,
+                body_font.clone(),
                 TextColor(theme::INK),
                 TextLayout::justify(Justify::Right),
                 HudText(HudTextKind::Hz(HandSide::Right)),
+            ));
+            panel.spawn((
+                Text::new(""),
+                body_font,
+                TextColor(theme::INK),
+                TextLayout::justify(Justify::Right),
+                HudText(HudTextKind::Beam(HandSide::Right)),
             ));
         });
 
@@ -176,7 +191,11 @@ fn setup_hud(mut commands: Commands, asset_server: Res<AssetServer>) {
             },
             BackgroundColor(theme::plate()),
             children![(
-                Text::new("Stick izq: moverse · Stick der: mirar · ZL/ZR: agarrar · B: saltar · clic stick izq: agacharse · −/+: recentrar"),
+                Text::new(
+                    "Stick izq: moverse · Stick der: mirar · ZL/ZR: agarrar · B: saltar · clic stick izq: agacharse · −/+: recentrar\n\
+                     Rayo: ↑↓ / X Y distancia · L/R + stick: rotar · → / A: física · Vista: Home / V · Cámara: F8 · Grabar: Captura / F9"
+                ),
+                TextLayout::justify(Justify::Center),
                 TextFont {
                     font: asset_server.load(theme::FONT_MEDIUM).into(),
                     font_size: FontSize::Px(14.0),
@@ -189,6 +208,8 @@ fn setup_hud(mut commands: Commands, asset_server: Res<AssetServer>) {
 
 fn update_hud(
     hands: Res<Hands>,
+    beam: Res<crate::grab::BeamStatus>,
+    views: Res<crate::views::Views>,
     time: Res<Time>,
     mut state: ResMut<HudState>,
     mut texts: Query<(&HudText, &mut Text)>,
@@ -203,7 +224,21 @@ fn update_hud(
 
     for (kind, mut text) in &mut texts {
         match kind.0 {
-            HudTextKind::Fps => text.0 = format!("{:.0} FPS", state.fps),
+            HudTextKind::Fps => {
+                text.0 = format!("{:.0} FPS · Vista: {}", state.fps, views.mode.label())
+            }
+            HudTextKind::Beam(side) => {
+                let status = beam.hands[side.index()];
+                text.0 = if status.holding {
+                    format!(
+                        "Rayo: {}{}",
+                        status.mode.label(),
+                        if status.rotating { " · rotando" } else { "" }
+                    )
+                } else {
+                    String::new()
+                };
+            }
             HudTextKind::Hz(side) => {
                 let input = match side {
                     HandSide::Left => &hands.left,

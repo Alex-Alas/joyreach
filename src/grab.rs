@@ -340,7 +340,77 @@ enum HoldKind {
         hand_rotation: Quat,
         /// Prop orientation at grab.
         prop_rotation: Quat,
+        /// Extra world-space rotation from L/R + stick, applied on top of the wrist delta.
+        spin: Quat,
+        /// Physics the prop gets when released (cycled with → / A while held).
+        mode: PropMode,
     },
+}
+
+/// What a prop does after the beam lets go of it (physics-gun modes).
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PropMode {
+    /// Gravity and the usual contacts.
+    #[default]
+    Normal,
+    /// Hangs where it was released (no gravity, heavy damping); still solid and pushable.
+    Frozen,
+    /// No gravity, no damping: keeps drifting and spinning after a throw.
+    ZeroG,
+}
+
+impl PropMode {
+    pub fn next(self) -> Self {
+        match self {
+            PropMode::Normal => PropMode::Frozen,
+            PropMode::Frozen => PropMode::ZeroG,
+            PropMode::ZeroG => PropMode::Normal,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PropMode::Normal => "Normal",
+            PropMode::Frozen => "Congelado",
+            PropMode::ZeroG => "Gravedad cero",
+        }
+    }
+
+    /// (gravity scale, linear damping, angular damping) applied at release.
+    pub fn physics(self) -> (f32, f32, f32) {
+        match self {
+            PropMode::Normal => (1.0, 0.0, 0.0),
+            PropMode::Frozen => (0.0, 12.0, 12.0),
+            PropMode::ZeroG => (0.0, 0.02, 0.02),
+        }
+    }
+}
+
+/// Per-hand beam status for the HUD and the stick routing (L/R + stick rotates the prop
+/// instead of moving / looking).
+#[derive(Resource, Default, Clone, Copy, Debug)]
+pub struct BeamStatus {
+    pub hands: [BeamHandStatus; 2],
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BeamHandStatus {
+    /// The hand is holding a prop with the beam.
+    pub holding: bool,
+    /// L/R is held: this hand's stick rotates the prop.
+    pub rotating: bool,
+    pub mode: PropMode,
+}
+
+/// L/R + stick rotation speed of a beam-held prop (rad/s at full tilt).
+pub const BEAM_ROTATE_SPEED: f32 = 2.5;
+
+/// Apply one stick step of rotation: yaw around world up, pitch around the beam's right axis.
+pub fn beam_spin_step(spin: Quat, stick: Vec2, beam_direction: Vec3, dt: f32) -> Quat {
+    let right = beam_direction.cross(Vec3::Y).normalize_or(Vec3::X);
+    let yaw = Quat::from_rotation_y(stick.x * BEAM_ROTATE_SPEED * dt);
+    let pitch = Quat::from_axis_angle(right, -stick.y * BEAM_ROTATE_SPEED * dt);
+    (yaw * pitch * spin).normalize()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -353,6 +423,8 @@ struct HeldProp {
 struct HandGrab {
     held: Option<HeldProp>,
     prev_trigger: bool,
+    /// → (left) / A (right) last step, for the physics-mode edge.
+    prev_mode_button: bool,
     /// Outline of the prop released moments ago (entity, seconds left).
     fade: Option<(Entity, f32)>,
     /// Hand velocity history for the throw (ring buffer).
@@ -368,6 +440,7 @@ impl Default for HandGrab {
         Self {
             held: None,
             prev_trigger: false,
+            prev_mode_button: false,
             fade: None,
             linear_history: [Vec3::ZERO; THROW_SAMPLES],
             angular_history: [Vec3::ZERO; THROW_SAMPLES],
@@ -510,6 +583,7 @@ pub struct GrabPlugin;
 impl Plugin for GrabPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<GrabState>()
+            .init_resource::<BeamStatus>()
             .add_systems(Startup, setup_beams)
             .add_systems(
                 Update,
@@ -597,6 +671,8 @@ fn drive_grabs(
         With<Grabbable>,
     >,
     prop_ids: Query<(Entity, &Position, &Rotation, &Collider, &RigidBody), With<Grabbable>>,
+    prop_modes: Query<&PropMode>,
+    mut status: ResMut<BeamStatus>,
     mut rumble: MessageWriter<Rumble>,
 ) {
     let dt = time.delta_secs().max(1e-5);
@@ -663,6 +739,11 @@ fn drive_grabs(
         let hand = state.hand_mut(side);
         hand.prev_trigger = trigger;
         hand.push_velocity(hand_velocity, hand_spin);
+        // → (left d-pad) / A (right): cycle what the beam-held prop does when released.
+        let mode_button = input.connected && input.face[3];
+        let mode_pressed = mode_button && !hand.prev_mode_button;
+        hand.prev_mode_button = mode_button;
+        status.hands[side.index()] = BeamHandStatus::default();
 
         let Some((palm, palm_rotation, ray)) = palm_poses[side.index()] else {
             continue;
@@ -700,6 +781,8 @@ fn drive_grabs(
                                 local_offset: rotation.0.inverse() * (hit.point - position.0),
                                 hand_rotation: palm_rotation,
                                 prop_rotation: rotation.0,
+                                spin: Quat::IDENTITY,
+                                mode: prop_modes.get(entity).copied().unwrap_or_default(),
                             }
                         }
                     };
@@ -761,6 +844,27 @@ fn drive_grabs(
                 *distance = adjust_hold_distance(*distance, axis, dt);
             }
         }
+        // L/R + this hand's stick rotates the prop; → / A cycles its release physics.
+        if let HoldKind::Beam { spin, mode, .. } = &mut held.hold {
+            let rotating = input.connected && input.shoulder;
+            if rotating {
+                *spin = beam_spin_step(*spin, input.stick, ray.direction, dt);
+            }
+            if mode_pressed {
+                *mode = mode.next();
+                rumble.write(Rumble {
+                    hand: rumble_hand(side),
+                    strength: 0.45,
+                    ms: 18,
+                });
+                info!("beam mode {:?}: {}", side, mode.label());
+            }
+            status.hands[side.index()] = BeamHandStatus {
+                holding: true,
+                rotating,
+                mode: *mode,
+            };
+        }
         hand.held = Some(held);
 
         if just_released {
@@ -789,6 +893,15 @@ fn drive_grabs(
                 .entity(held.entity)
                 .remove::<SleepingDisabled>()
                 .insert(CollisionLayers::DEFAULT);
+            if let HoldKind::Beam { mode, .. } = held.hold {
+                let (gravity, linear_damping, angular_damping) = mode.physics();
+                commands.entity(held.entity).insert((
+                    mode,
+                    GravityScale(gravity),
+                    LinearDamping(linear_damping),
+                    AngularDamping(angular_damping),
+                ));
+            }
             hand.held = None;
             hand.fade = Some((held.entity, OUTLINE_FADE));
             let (strength, ms) = RUMBLE_THROW;
@@ -825,6 +938,8 @@ fn drive_grabs(
                 local_offset,
                 hand_rotation,
                 prop_rotation,
+                spin,
+                ..
             } => {
                 let anchor = beam_target(ray.origin, ray.direction, distance);
                 let target_position = anchor + rotation.0 * local_offset;
@@ -833,7 +948,7 @@ fn drive_grabs(
                 let target_velocity = hand_velocity + hand_spin.cross(anchor - ray.origin);
                 (
                     target_position,
-                    beam_rotation(palm_rotation, hand_rotation, prop_rotation),
+                    (spin * beam_rotation(palm_rotation, hand_rotation, prop_rotation)).normalize(),
                     target_velocity,
                 )
             }
@@ -1314,6 +1429,30 @@ mod tests {
             (rotated - Vec3::Y).length() < 1e-5,
             "object X should end up on Y, got {rotated:?}"
         );
+    }
+
+    #[test]
+    fn prop_modes_cycle_and_freeze_has_no_gravity() {
+        let mut mode = PropMode::Normal;
+        for _ in 0..3 {
+            mode = mode.next();
+        }
+        assert_eq!(mode, PropMode::Normal);
+        assert_eq!(PropMode::Frozen.physics().0, 0.0);
+        assert!(PropMode::Frozen.physics().1 > 5.0, "frozen props must stop quickly");
+        assert_eq!(PropMode::Normal.physics(), (1.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn stick_spin_yaws_around_world_up() {
+        // Full right stick for 1 s at 2.5 rad/s: 2.5 rad of yaw, no pitch.
+        let mut spin = Quat::IDENTITY;
+        for _ in 0..100 {
+            spin = beam_spin_step(spin, Vec2::X, Vec3::NEG_Z, 0.01);
+        }
+        let (axis, angle) = spin.to_axis_angle();
+        assert!((angle - BEAM_ROTATE_SPEED).abs() < 1e-3, "angle {angle}");
+        assert!(axis.abs().dot(Vec3::Y) > 0.999, "axis {axis}");
     }
 
     #[test]

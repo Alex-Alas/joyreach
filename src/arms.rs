@@ -11,6 +11,7 @@
 //! `solve_arm` is pure and unit tested; the ECS systems only apply its output.
 
 use avian3d::prelude::*;
+use bevy::camera::visibility::RenderLayers;
 use bevy::prelude::*;
 use bevy::world_serialization::WorldInstanceReady;
 
@@ -63,12 +64,22 @@ const WRIST_RADIUS: f32 = 0.033;
 
 /// Upper arm is hidden while its shoulder is this close to the eye: at 80° FOV a 10 cm
 /// sleeve 20 cm from the camera covers a whole bottom corner of the frame (M2a fix).
-const UPPER_NEAR_HIDE: f32 = 0.30;
-/// Fully visible once the upper arm clears this distance from the eye.
-const UPPER_NEAR_SHOW: f32 = 0.52;
+const UPPER_NEAR_HIDE: f32 = 0.40;
+/// Fully visible once the upper arm clears this distance from the eye (a full torso lean puts
+/// it at ~0.57 m). Raised from 0.30/0.52 with the shoulder slide, which otherwise put a huge
+/// sleeve right in front of the lens during a push.
+const UPPER_NEAR_SHOW: f32 = 0.56;
 
-/// Defensive clamp for the reach offset fed into the IK (the input already clamps it).
-const REACH_IK_MAX: f32 = 0.35;
+/// Virtual reach per metre of measured hand depth. The per-movement depth reads short on real
+/// recordings (a ~30 cm push measured 10-20 cm) and a monitor shows depth poorly, so the arm
+/// travels 1.6× what the Joy-Con measured.
+pub const REACH_GAIN: f32 = 1.6;
+/// Clamp on the (gained) reach fed into the IK.
+const REACH_IK_MAX: f32 = 0.60;
+/// When the target is beyond the straight arm, the shoulder slides toward it by the overflow,
+/// up to this far (m): shoulder protraction plus a torso lean, so a full push reaches ~25 cm
+/// further than the arm alone.
+const SHOULDER_SLIDE_MAX: f32 = 0.25;
 
 /// Which physical hand a chain belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -222,22 +233,28 @@ fn two_bone_ik(side: HandSide, shoulder: Vec3, target: Vec3) -> (Vec3, Vec3) {
 /// with two-bone IK, so a real push/pull moves the whole arm instead of only the hand.
 pub fn solve_arm_with_reach(side: HandSide, orientation: Quat, reach: Vec3) -> ArmPose {
     let base = solve_arm(side, orientation);
-    let reach = reach.clamp_length_max(REACH_IK_MAX);
+    let reach = (reach * REACH_GAIN).clamp_length_max(REACH_IK_MAX);
     if reach.length_squared() < 1e-8 {
         return base;
     }
 
     let handed = Vec3::new(side.sign_x(), 1.0, 1.0);
-    let (wrist, elbow) = two_bone_ik(side, base.shoulder, base.wrist + reach);
+    let target = base.wrist + reach;
+    // Beyond the straight arm, slide the shoulder toward the target (protraction + lean).
+    let arm_length = (ELBOW_REST - SHOULDER).length() + WRIST_REST.length();
+    let to_target = target - base.shoulder;
+    let overflow = (to_target.length() - arm_length).clamp(0.0, SHOULDER_SLIDE_MAX);
+    let shoulder = base.shoulder + to_target.normalize_or_zero() * overflow;
+    let (wrist, elbow) = two_bone_ik(side, shoulder, target);
     let hand = wrist + base.hand_rotation * (CONTROLLER_REST * handed);
 
     let rest_upper = (ELBOW_REST - SHOULDER).normalize();
     let rest_fore = WRIST_REST.normalize();
-    let elbow_rotation = Quat::from_rotation_arc(rest_upper, (elbow - base.shoulder).normalize());
+    let elbow_rotation = Quat::from_rotation_arc(rest_upper, (elbow - shoulder).normalize());
     let wrist_rotation = Quat::from_rotation_arc(rest_fore, (wrist - elbow).normalize());
 
     ArmPose {
-        shoulder: base.shoulder,
+        shoulder,
         elbow,
         wrist,
         hand,
@@ -303,6 +320,10 @@ struct ArmAnim {
 #[derive(Component, Clone, Copy)]
 enum ArmPart {
     Upper(HandSide),
+    /// Full-length upper arm + shoulder ball on the avatar layer: only the outside views draw
+    /// it, so third-person shows a whole arm while first person keeps the near-camera fade.
+    UpperOutside(HandSide),
+    ShoulderOutside(HandSide),
     Elbow(HandSide),
     Fore(HandSide),
     Wrist(HandSide),
@@ -433,6 +454,24 @@ fn setup_arms(
                         },
                         Transform::default(),
                     ));
+                    for part in [ArmPart::UpperOutside(side), ArmPart::ShoulderOutside(side)] {
+                        let mesh = match part {
+                            ArmPart::UpperOutside(_) => cylinder.clone(),
+                            _ => ball.clone(),
+                        };
+                        arm.spawn((
+                            part,
+                            Mesh3d(mesh),
+                            MeshMaterial3d(sleeve.clone()),
+                            SleevePart {
+                                side,
+                                normal: sleeve.clone(),
+                                muted: muted.clone(),
+                            },
+                            Transform::default(),
+                            RenderLayers::layer(crate::views::AVATAR_LAYER),
+                        ));
+                    }
                     // Elbow ball hides the joint seam.
                     arm.spawn((
                         ArmPart::Elbow(side),
@@ -560,12 +599,15 @@ fn update_arms(
     time: Res<Time>,
     hands: Res<Hands>,
     lean: Res<ArmLean>,
+    views: Res<crate::views::Views>,
     mut curl: ResMut<HandCurl>,
     mut roots: Query<(&ArmRoot, &mut ArmAnim)>,
     mut parts: Query<(&ArmPart, &mut Transform)>,
     mut sleeves: Query<(&SleevePart, &mut MeshMaterial3d<StandardMaterial>)>,
 ) {
     let dt = time.delta_secs();
+    // Outside views see the whole arm; the near-camera fades are first-person only.
+    let outside = views.mode != crate::views::ViewMode::FirstPerson;
     let mut states = [HandState::default(); 2];
 
     for (root, mut anim) in &mut roots {
@@ -617,6 +659,20 @@ fn update_arms(
                     transform.scale.y *= fade;
                 }
             }
+            ArmPart::UpperOutside(side) => {
+                let Some(pose) = states[side.index()].pose else {
+                    continue;
+                };
+                segment(&mut transform, pose.shoulder, pose.elbow, UPPER_RADIUS);
+            }
+            ArmPart::ShoulderOutside(side) => {
+                let Some(pose) = states[side.index()].pose else {
+                    continue;
+                };
+                transform.translation = pose.shoulder;
+                transform.rotation = Quat::IDENTITY;
+                transform.scale = Vec3::splat(UPPER_RADIUS * 1.15);
+            }
             ArmPart::Fore(side) => {
                 let Some(pose) = states[side.index()].pose else {
                     continue;
@@ -629,8 +685,13 @@ fn update_arms(
                 };
                 // A big joint ball only makes sense when the upper arm is there to hide the
                 // seam. With the upper arm hidden, match the forearm radius so the elbow is not
-                // a red/blue blob bigger than the arm itself.
-                let fade = states[side.index()].upper_fade;
+                // a red/blue blob bigger than the arm itself. Outside views draw the full upper
+                // arm, so they get the full ball.
+                let fade = if outside {
+                    1.0
+                } else {
+                    states[side.index()].upper_fade
+                };
                 let radius = FOREARM_RADIUS + (ELBOW_RADIUS - FOREARM_RADIUS) * fade;
                 transform.translation = pose.elbow;
                 transform.rotation = pose.elbow_rotation;
@@ -652,7 +713,11 @@ fn update_arms(
                 // clipping through the camera (DESIGN §7, "cerca de la cámara").
                 let distance = (ARM_ANCHOR_OFFSET + pose.hand).length();
                 let fade = ((distance - 0.16) / (0.30 - 0.16)).clamp(0.0, 1.0);
-                let fade = fade * fade * (3.0 - 2.0 * fade);
+                let fade = if outside {
+                    1.0
+                } else {
+                    fade * fade * (3.0 - 2.0 * fade)
+                };
 
                 transform.translation = pose.hand;
                 transform.rotation = pose.hand_rotation;
@@ -1127,13 +1192,15 @@ mod tests {
         let reach = Vec3::new(0.0, 0.0, -0.06);
         let pose = solve_arm_with_reach(HandSide::Right, Quat::IDENTITY, reach);
 
-        // The wrist follows the target exactly while it is within reach...
+        // The wrist follows the (gained) target exactly while it is within reach...
+        let target = base.wrist + reach * REACH_GAIN;
         assert!(
-            (pose.wrist - (base.wrist + reach)).length() < 1e-3,
+            (pose.wrist - target).length() < 1e-3,
             "wrist {:?} should be {:?}",
             pose.wrist,
-            base.wrist + reach
+            target
         );
+        assert_eq!(pose.shoulder, base.shoulder, "no shoulder slide inside the arm's reach");
         // ...the bones keep their lengths...
         let (upper, fore) = segment_lengths();
         assert!(((pose.elbow - pose.shoulder).length() - upper).abs() < 1e-3);
@@ -1145,6 +1212,19 @@ mod tests {
             pose.hand,
             pose.wrist
         );
+    }
+
+    /// A full push goes past the straight arm: the shoulder slides forward (up to 25 cm) and
+    /// the hand ends noticeably further out than the arm alone allows.
+    #[test]
+    fn full_push_slides_the_shoulder_forward() {
+        let base = solve_arm(HandSide::Right, Quat::IDENTITY);
+        let pose = solve_arm_with_reach(HandSide::Right, Quat::IDENTITY, Vec3::new(0.0, 0.0, -0.35));
+        let slide = pose.shoulder - base.shoulder;
+        assert!(slide.z < -0.05, "the shoulder should move forward, slid {slide:?}");
+        assert!(slide.length() <= SHOULDER_SLIDE_MAX + 1e-4);
+        let gained = base.wrist.z - pose.wrist.z;
+        assert!(gained > 0.35, "a 35 cm push should move the wrist > 35 cm forward, got {gained}");
     }
 
     #[test]
