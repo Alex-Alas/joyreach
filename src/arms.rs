@@ -12,6 +12,7 @@
 
 use avian3d::prelude::*;
 use bevy::prelude::*;
+use bevy::world_serialization::WorldInstanceReady;
 
 use crate::joycon::{HandInput, Hands};
 use crate::player::{EYE_HEIGHT, PlayerBody, PlayerRig, PlayerSet};
@@ -59,8 +60,6 @@ const UPPER_RADIUS: f32 = 0.052;
 const FOREARM_RADIUS: f32 = 0.036;
 const ELBOW_RADIUS: f32 = 0.052;
 const WRIST_RADIUS: f32 = 0.033;
-/// Total travel of the finger curl, in radians (≈ 83°).
-const FINGER_CURL: f32 = 1.45;
 
 /// Which physical hand a chain belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -190,8 +189,14 @@ impl Plugin for ArmsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ArmLean>()
             .init_resource::<HandMotion>()
+            .init_resource::<HandCurl>()
             .add_systems(Startup, setup_arms.after(crate::player::spawn_player))
-            .add_systems(Update, (update_lean, update_arms).chain().after(PlayerSet))
+            .add_systems(
+                Update,
+                (update_lean, update_arms, pose_hand_models)
+                    .chain()
+                    .after(PlayerSet),
+            )
             .add_systems(FixedUpdate, drive_hand_bodies.in_set(HandBodiesSet));
     }
 }
@@ -226,13 +231,43 @@ enum ArmPart {
     Wrist(HandSide),
     /// Pivot at the palm centre: position, orientation and near-camera fade.
     Palm(HandSide),
-    /// Rounded palm mesh; constant scale so the fingers are not distorted.
-    PalmMesh,
-    Finger {
-        side: HandSide,
-        base: Quat,
-        amount: f32,
-    },
+}
+
+/// The matte glove material, also used to override the hand models' grey material.
+#[derive(Resource, Clone)]
+struct GloveMaterial(Handle<StandardMaterial>);
+
+/// Root of a skinned hand scene. The fingers are posed by [`pose_hand_models`].
+#[derive(Component)]
+struct HandModel {
+    side: HandSide,
+}
+
+/// One posed joint of a finger, with its bind pose (Armature space) captured on load.
+struct Joint {
+    entity: Entity,
+    bind: Transform,
+    /// Relaxed-hand rotation about local X, radians.
+    base_angle: f32,
+    /// Extra rotation about local X at a full fist, radians.
+    max_angle: f32,
+}
+
+/// One finger: metacarpal → proximal → intermediate → distal → tip as present.
+struct FingerChain {
+    joints: Vec<Joint>,
+}
+
+#[derive(Component)]
+struct HandRig {
+    side: HandSide,
+    fingers: Vec<FingerChain>,
+}
+
+/// Smoothed finger curl per hand (0 = open, 1 = fist), set by `update_arms`.
+#[derive(Resource, Default)]
+pub struct HandCurl {
+    pub value: [f32; 2],
 }
 
 /// A sleeve mesh that swaps to a desaturated material while its Joy-Con is off.
@@ -252,7 +287,6 @@ pub struct HandBody {
 #[derive(Clone, Copy, Default)]
 struct HandState {
     pose: Option<ArmPose>,
-    curl: f32,
     connected: bool,
 }
 
@@ -269,12 +303,11 @@ fn setup_arms(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    asset_server: Res<AssetServer>,
     body: Single<Entity, With<PlayerBody>>,
 ) {
     let cylinder = meshes.add(Cylinder::new(0.5, 1.0).mesh().resolution(24));
     let ball = meshes.add(Sphere::new(1.0).mesh().uv(24, 16));
-    let finger_mesh = meshes.add(Capsule3d::new(0.0095, 0.062));
-    let thumb_mesh = meshes.add(Capsule3d::new(0.0110, 0.050));
 
     let glove = materials.add(StandardMaterial {
         base_color: theme::GLOVE,
@@ -282,6 +315,7 @@ fn setup_arms(
         reflectance: 0.2,
         ..default()
     });
+    commands.insert_resource(GloveMaterial(glove.clone()));
 
     let sleeve_handles: [(Handle<StandardMaterial>, Handle<StandardMaterial>); 2] = [
         (
@@ -299,7 +333,6 @@ fn setup_arms(
     commands.entity(*body).with_children(|parent| {
         for side in [HandSide::Left, HandSide::Right] {
             let (sleeve, muted) = sleeve_handles[side.index()].clone();
-            let sign = side.sign_x();
 
             parent
                 .spawn((
@@ -358,53 +391,27 @@ fn setup_arms(
                         Transform::default(),
                     ));
 
-                    // Glove: rounded palm + four fingers + thumb.
+                    // Glove: a skinned WebXR generic-hand model (W3C, see
+                    // assets/models/hands/LICENSE.md). Aligned and posed once loaded.
                     arm.spawn((
                         ArmPart::Palm(side),
                         Transform::default(),
                         Visibility::default(),
                     ))
                     .with_children(|palm| {
+                        let path = match side {
+                            HandSide::Left => "models/hands/left.glb",
+                            HandSide::Right => "models/hands/right.glb",
+                        };
                         palm.spawn((
-                            ArmPart::PalmMesh,
-                            Mesh3d(ball.clone()),
-                            MeshMaterial3d(glove.clone()),
-                            Transform::from_scale(Vec3::new(0.043, 0.019, 0.048)),
-                        ));
-                        for (i, x) in [-0.030_f32, -0.010, 0.010, 0.030].into_iter().enumerate() {
-                            palm.spawn((
-                                ArmPart::Finger {
-                                    side,
-                                    base: Quat::IDENTITY,
-                                    amount: 1.0 - i as f32 * 0.06,
-                                },
-                                Transform::from_xyz(x, 0.0, -0.040),
-                                Visibility::default(),
-                            ))
-                            .with_child((
-                                Mesh3d(finger_mesh.clone()),
-                                MeshMaterial3d(glove.clone()),
-                                Transform::from_xyz(0.0, 0.0, -0.0405)
-                                    .with_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
-                            ));
-                        }
-                        // Thumb sits on the inner side of the hand.
-                        palm.spawn((
-                            ArmPart::Finger {
-                                side,
-                                base: Quat::from_rotation_y(-sign * 0.55)
-                                    * Quat::from_rotation_z(sign * 0.35),
-                                amount: 0.7,
-                            },
-                            Transform::from_xyz(-0.042 * sign, 0.0, -0.012),
+                            HandModel { side },
+                            Transform::default(),
                             Visibility::default(),
+                            WorldAssetRoot(
+                                asset_server.load(GltfAssetLabel::Scene(0).from_asset(path)),
+                            ),
                         ))
-                        .with_child((
-                            Mesh3d(thumb_mesh.clone()),
-                            MeshMaterial3d(glove.clone()),
-                            Transform::from_xyz(0.0, 0.0, -0.0365)
-                                .with_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
-                        ));
+                        .observe(hand_model_ready);
                     });
                 });
         }
@@ -459,6 +466,7 @@ fn update_lean(
 fn update_arms(
     time: Res<Time>,
     hands: Res<Hands>,
+    mut curl: ResMut<HandCurl>,
     mut roots: Query<(&ArmRoot, &mut ArmAnim)>,
     mut parts: Query<(&ArmPart, &mut Transform)>,
     mut sleeves: Query<(&SleevePart, &mut MeshMaterial3d<StandardMaterial>)>,
@@ -476,6 +484,7 @@ fn update_arms(
         // Close in ~80 ms, open in ~120 ms, exponential ease-out (DESIGN §7).
         let tau = if target > anim.curl { 0.08 } else { 0.12 };
         anim.curl += (target - anim.curl) * (1.0 - (-dt / tau).exp());
+        curl.value[root.side.index()] = anim.curl;
 
         let orientation = if input.connected {
             input.orientation
@@ -484,7 +493,6 @@ fn update_arms(
         };
         states[root.side.index()] = HandState {
             pose: Some(solve_arm(root.side, orientation)),
-            curl: anim.curl,
             connected: input.connected,
         };
     }
@@ -531,18 +539,9 @@ fn update_arms(
 
                 transform.translation = pose.hand;
                 transform.rotation = pose.hand_rotation;
-                // Scaling the pivot fades the whole glove (mesh + fingers) without
-                // ever distorting the finger capsules at normal distance.
+                // Scaling the pivot fades the whole glove (scene + fingers) without
+                // ever distorting the model at normal distance.
                 transform.scale = Vec3::splat(fade);
-            }
-            ArmPart::PalmMesh => {}
-            ArmPart::Finger {
-                side,
-                base,
-                amount,
-            } => {
-                let curl = states[side.index()].curl;
-                transform.rotation = base * Quat::from_rotation_x(-FINGER_CURL * amount * curl);
             }
         }
     }
@@ -557,6 +556,210 @@ fn update_arms(
         if material.0 != *wanted {
             material.0 = wanted.clone();
         }
+    }
+}
+
+/// The glTF wrist frame is aligned to the palm pivot; the palm centre sits this far
+/// in front of the wrist (metres), so the hand model is shifted back by it.
+const PALM_OFFSET_Z: f32 = 0.048;
+
+/// Relaxed-hand base curl and full-fist extra curl, per finger phalanx
+/// (proximal, intermediate, distal), in degrees.
+const FINGER_BASE_CURL: [f32; 3] = [12.0, 8.0, 6.0];
+const FINGER_MAX_CURL: [f32; 3] = [70.0, 90.0, 60.0];
+/// The thumb curls less and its metacarpal turns toward the palm.
+const THUMB_BASE_CURL: [f32; 3] = [0.0, 8.0, 6.0];
+const THUMB_MAX_CURL: [f32; 3] = [18.0, 40.0, 40.0];
+
+/// Rotation about the joint's local X that closes the hand toward the palm.
+/// Verified visually; the left model is a mirror, so it can need its own sign.
+fn curl_sign(side: HandSide) -> f32 {
+    match side {
+        HandSide::Left => 1.0,
+        HandSide::Right => 1.0,
+    }
+}
+
+/// On the scene's ready event: align the wrist to the palm pivot, swap the grey
+/// material for the glove and cache the finger joints (WebXR hand joint names).
+fn hand_model_ready(
+    ready: On<WorldInstanceReady>,
+    model: Query<&HandModel>,
+    mut commands: Commands,
+    children: Query<&Children>,
+    parents: Query<&ChildOf>,
+    names: Query<&Name>,
+    transforms: Query<&Transform>,
+    mut materials: Query<&mut MeshMaterial3d<StandardMaterial>>,
+    glove: Res<GloveMaterial>,
+) {
+    let root = ready.entity;
+    let Ok(model) = model.get(root) else {
+        return;
+    };
+
+    let mut wrist = None;
+    let mut named: Vec<(String, Entity)> = Vec::new();
+    for descendant in children.iter_descendants(root) {
+        if let Ok(name) = names.get(descendant) {
+            let name = name.as_str().to_string();
+            if name == "wrist" {
+                wrist = Some(descendant);
+            }
+            named.push((name, descendant));
+        }
+        if let Ok(mut material) = materials.get_mut(descendant) {
+            material.0 = glove.0.clone();
+        }
+    }
+    let Some(wrist) = wrist else {
+        warn!("hand model for {:?} has no wrist joint", model.side);
+        return;
+    };
+    let Some(wrist_to_root) = transform_to(root, wrist, &parents, &transforms) else {
+        warn!("hand model for {:?} is not parented to its root", model.side);
+        return;
+    };
+
+    // Put the wrist joint frame 4.8 cm behind the palm pivot: fingers along −Z,
+    // back of the hand +Y, exactly the pivot's frame.
+    let palm = Transform::from_translation(Vec3::new(0.0, 0.0, PALM_OFFSET_Z));
+    commands
+        .entity(root)
+        .insert(palm.mul_transform(inverse_transform(wrist_to_root)));
+
+    let find = |name: &str| {
+        named
+            .iter()
+            .find_map(|(candidate, entity)| (candidate == name).then_some(*entity))
+    };
+    let joint = |name: &str, base_deg: f32, max_deg: f32| {
+        find(name).and_then(|entity| {
+            transforms.get(entity).ok().map(|bind| Joint {
+                entity,
+                bind: *bind,
+                base_angle: base_deg.to_radians(),
+                max_angle: max_deg.to_radians(),
+            })
+        })
+    };
+
+    let mut fingers = Vec::new();
+    for finger in ["index", "middle", "ring", "pinky"] {
+        // The metacarpal stays fixed for the four fingers: a real hand curls from
+        // the knuckles out, and the bind pose already has them in place.
+        let mut joints = Vec::new();
+        if let Some(j) = joint(&format!("{finger}-finger-metacarpal"), 0.0, 0.0) {
+            joints.push(j);
+        }
+        for (index, part) in ["proximal", "intermediate", "distal"].iter().enumerate() {
+            let name = format!("{finger}-finger-phalanx-{part}");
+            if let Some(j) = joint(&name, FINGER_BASE_CURL[index], FINGER_MAX_CURL[index]) {
+                joints.push(j);
+            }
+        }
+        if let Some(j) = joint(&format!("{finger}-finger-tip"), 0.0, 0.0) {
+            joints.push(j);
+        }
+        if joints.len() > 2 {
+            fingers.push(FingerChain { joints });
+        }
+    }
+    let mut thumb = Vec::new();
+    if let Some(j) = joint("thumb-metacarpal", THUMB_BASE_CURL[0], THUMB_MAX_CURL[0]) {
+        thumb.push(j);
+    }
+    for (index, part) in ["proximal", "distal"].iter().enumerate() {
+        let name = format!("thumb-phalanx-{part}");
+        if let Some(j) = joint(&name, THUMB_BASE_CURL[index + 1], THUMB_MAX_CURL[index + 1]) {
+            thumb.push(j);
+        }
+    }
+    if let Some(j) = joint("thumb-tip", 0.0, 0.0) {
+        thumb.push(j);
+    }
+    if thumb.len() > 2 {
+        fingers.push(FingerChain { joints: thumb });
+    }
+
+    if fingers.len() != 5 {
+        warn!(
+            "hand model for {:?}: found {} finger chains, expected 5",
+            model.side,
+            fingers.len()
+        );
+    }
+    commands.entity(root).insert(HandRig {
+        side: model.side,
+        fingers,
+    });
+}
+
+/// Apply the smoothed curl to every cached finger joint.
+///
+/// The WebXR generic-hand rig stores the joints as flat siblings in Armature space
+/// (absolute bind transforms, not a parent→child chain), so each joint is posed by
+/// composing the parent's bind→posed delta: `p' = p_parent' + Δ_parent·(p − p_parent)`.
+fn pose_hand_models(
+    curl: Res<HandCurl>,
+    rigs: Query<&HandRig>,
+    mut transforms: Query<&mut Transform>,
+) {
+    for rig in &rigs {
+        let curl = curl.value[rig.side.index()];
+        let sign = curl_sign(rig.side);
+        for finger in &rig.fingers {
+            let mut parent_posed: Option<Vec3> = None;
+            let mut parent_delta = Quat::IDENTITY;
+            let mut previous_bind = Vec3::ZERO;
+            for joint in &finger.joints {
+                let angle = joint.base_angle + joint.max_angle * curl;
+                let bend = Quat::from_rotation_x(-sign * angle);
+                let rotation = parent_delta * joint.bind.rotation * bend;
+                let translation = match parent_posed {
+                    None => joint.bind.translation,
+                    Some(parent) => parent + parent_delta * (joint.bind.translation - previous_bind),
+                };
+                if let Ok(mut transform) = transforms.get_mut(joint.entity) {
+                    transform.translation = translation;
+                    transform.rotation = rotation;
+                }
+                parent_delta = rotation * joint.bind.rotation.inverse();
+                parent_posed = Some(translation);
+                previous_bind = joint.bind.translation;
+            }
+        }
+    }
+}
+
+/// `entity`'s transform expressed in `root`'s space (excluding `root` itself).
+fn transform_to(
+    root: Entity,
+    entity: Entity,
+    parents: &Query<&ChildOf>,
+    transforms: &Query<&Transform>,
+) -> Option<Transform> {
+    let mut accumulated = *transforms.get(entity).ok()?;
+    let mut current = entity;
+    while let Ok(child_of) = parents.get(current) {
+        let parent = child_of.parent();
+        if parent == root {
+            return Some(accumulated);
+        }
+        accumulated = transforms.get(parent).ok()?.mul_transform(accumulated);
+        current = parent;
+    }
+    None
+}
+
+/// Inverse of a TRS transform (no shear; glTF node transforms qualify).
+fn inverse_transform(transform: Transform) -> Transform {
+    let rotation = transform.rotation.inverse();
+    let scale = transform.scale.recip();
+    Transform {
+        translation: -(scale * (rotation * transform.translation)),
+        rotation,
+        scale,
     }
 }
 

@@ -50,6 +50,7 @@ Stack: Rust, Bevy 0.20, avian3d 0.8 y SDL3 (`sdl3-sys`, estático).
 ## Créditos
 
 - Modelo de brazo portado de [`GvrArmModel`](https://github.com/googlevr/gvr-unity-sdk) (Google, Apache-2.0).
+- Manos: mallas `generic-hand` de [WebXR Input Profiles](https://github.com/immersive-web/webxr-input-profiles) (W3C Software and Document License 2023); aviso completo en `assets/models/hands/LICENSE.md`.
 - Fuente [M PLUS Rounded 1c](https://fonts.google.com/specimen/M+PLUS+Rounded+1c) (OFL, `assets/fonts/OFL.txt`).
 - [SDL](https://libsdl.org) (zlib) · [Bevy](https://bevy.org) · [avian](https://github.com/avianphysics/avian).
 - Joy-Con reverse engineering: [dekuNukem](https://github.com/dekuNukem/Nintendo_Switch_Reverse_Engineering); gyro: [GyroWiki](https://gyrowiki.jibbsmart.com).

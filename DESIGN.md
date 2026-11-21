@@ -63,6 +63,7 @@ Escala humana real (metros). Props de 8–15 cm: del tamaño de algo que agarras
 
 - Mangas: cápsulas con el color `joy.*` mate (roughness ~0.6). Antebrazo más delgado que el brazo superior.
 - Manos: guante `glove` mate, palma + 4 dedos + pulgar. Formas redondeadas, como el propio Joy-Con: nada de aristas vivas.
+  Malla del `generic-hand` de WebXR (W3C, crédito en README), material reemplazado por `glove`; las juntas de los dedos se articulan por gatillo y el pulgar queda hacia adentro.
 - **Gatillo = puño:** los dedos se cierran en ~80 ms con ease-out; al soltar, se abren en ~120 ms. Es la confirmación visual del agarre.
 - **Alcance:** mirar por debajo de −20° inclina el torso (hombros y manos bajan 35 cm y avanzan 25 cm, suavizado ~100 ms) para llegar a lo que muestra la cámara. A 0° el desplazamiento es cero.
 - Desconectado: el brazo queda en reposo y la manga baja a 50 % de saturación. Sin mensajes de error en el mundo.
