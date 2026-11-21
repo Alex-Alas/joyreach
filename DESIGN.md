@@ -1,0 +1,116 @@
+# DESIGN.md — joyreach
+
+Sistema visual y de experiencia. Lo técnico vive en `docs/BRIEF.md`; esto define **cómo se ve, se siente y se lee**. Toda pieza visual nueva (escena, prop, HUD, ventana) se valida contra este archivo.
+
+## 1. Lectura del brief
+
+- **Tema:** tus dos Joy-Con convertidos en tus brazos, dentro de un espacio 3D que ves en el monitor. Más adelante ese espacio aloja tus apps de escritorio.
+- **Público y contexto:** una persona sentada frente a su monitor, de noche, en su cuarto, con un Joy-Con en cada mano (el video original: cuarto con closet de madera, paredes verde menta, puerta crema, luz cálida de lámpara).
+- **Trabajo de la imagen:** que sepas **dónde está tu mano en profundidad** y **qué vas a agarrar** sin visión estéreo.
+- **Restricciones:** pantalla plana (sin estéreo), orientación 3DoF (posición inferida), Bevy 0.20 PBR, laptop RTX 3050.
+
+**Fuentes del mundo del tema** (de aquí sale cada decisión):
+1. El Joy-Con: rojo neón y azul neón oficiales, formas de cápsula, botones circulares, rieles laterales.
+2. El cuarto del video: madera de closet, pared verde menta, puerta crema, luz cálida de lámpara.
+3. La UI del sistema de Switch: tipografía redondeada japonesa, íconos de botón como formas físicas.
+
+## 2. Principio rector
+
+**Las manos son lo único saturado.** El mundo es cálido y de saturación baja; las mangas llevan el color exacto de cada Joy-Con. Lo que tienes en la mano física y lo que ves en pantalla comparten identidad: rojo = izquierda, azul = derecha, siempre, en todo (mangas, resaltes, cursores, HUD).
+
+**El movimiento audaz:** el color de la mano marca lo que va a tocar. El prop al alcance de la mano izquierda recibe un contorno rojo; el de la derecha, uno azul. Color = qué mano y qué objeto, en un solo gesto.
+
+## 3. Color
+
+Hex en sRGB. Valor (L) aproximado para planear contraste.
+
+| Token | Hex | Rol | Origen |
+|---|---|---|---|
+| `joy.left` | `#FF3C28` | Manga izq., contorno de agarre izq., cursor izq. | Joy-Con neón rojo |
+| `joy.right` | `#0AB9E6` | Manga der., contorno de agarre der., cursor der. | Joy-Con neón azul |
+| `glove` | `#EEE9DF` | Manos (guante mate) | Claro, contrasta con la madera de la mesa |
+| `deck` | `#7A5A3E` | Piso de madera (L≈40%) | Closet del video |
+| `walnut` | `#4E3627` | Mesa de trabajo (L≈25%) | Madera oscura: fondo para leer las manos |
+| `celadon` | `#C6D7CB` | Parapetos y muros bajos (L≈84%) | Pared menta del video |
+| `cream` | `#E9E1CF` | Marcos, puertas, ventanas (paneles) | Puerta del video |
+| `ink` | `#2B2A28` | Texto HUD, biseles de paneles | Cálido, no negro puro |
+
+Props agarrables (saturación media, **nunca rojo ni azul** para no competir con las manos): mostaza `#D9A13B`, salvia `#7E9F78`, ciruela `#7A5C85`, piedra `#A89F8E`, carbón `#3B3C3D`. (Tiza `#EDE8DD` se descartó: tenía el mismo valor que el guante y en pantalla se leía como una mano.)
+
+Reglas: ningún color del mundo supera la saturación de `joy.*`. Sin degradados decorativos; los degradados vienen solo de la luz.
+
+## 4. Luz y atmósfera
+
+- **Hora:** tarde avanzada, no atardecer de postal. Sol a **~55° de elevación**: las sombras caen casi debajo de los objetos y la sombra de la mano sobre la mesa dice su profundidad (la señal de distancia más fuerte sin estéreo).
+- Sol cálido (~5200 K) + cielo de `Atmosphere` como relleno frío. Sombras en cascada con buen rango cercano: la mesa (0–2 m) es lo que más importa.
+- **Señales de profundidad obligatorias** en el área de alcance: sombra de la mano nítida, SSAO para contacto, niebla leve solo en la lejanía (>15 m) para separar planos.
+- Tonemapping Tony McMapface, exposición `ev100 13.6` con sol `0.85 × RAW_SUNLIGHT`. AgX se descartó en la primera captura: lavaba el neón de las mangas a salmón/pastel y rompía el principio rector. Bloom muy bajo, solo para cursores emisivos.
+- Lo que no se hace: noche/neón, viñeta fuerte, aberración cromática, grano. Restan legibilidad de la mano.
+
+## 5. Espacio (M0)
+
+Terraza de madera `deck`, ~30×30 m, con parapetos bajos `celadon` en los bordes (límite + referencia de escala). Frente al spawn, a ~0.9 m, la mesa `walnut` (0.75 m de alto) con los props. Cerca: una pila de cajas y 2–3 pelotas grandes en el piso. Horizonte abierto: cielo y nada más; el detalle se concentra a distancia de brazo.
+
+Escala humana real (metros). Props de 8–15 cm: del tamaño de algo que agarras con una mano.
+
+## 6. Cámara
+
+- Ojos a 1.60 m, **FOV 80°**, sin head-bob (pelea con la precisión del brazo).
+- Los brazos ocupan el **25–35 % inferior** del cuadro en reposo; la mesa entra entera al mirar ~20° abajo.
+- Giro con stick: curva cuadrática; nunca aceleración de mouse.
+
+## 7. Brazos y manos
+
+- Mangas: cápsulas con el color `joy.*` mate (roughness ~0.6). Antebrazo más delgado que el brazo superior.
+- Manos: guante `glove` mate, palma + 4 dedos + pulgar. Formas redondeadas, como el propio Joy-Con: nada de aristas vivas.
+- **Gatillo = puño:** los dedos se cierran en ~80 ms con ease-out; al soltar, se abren en ~120 ms. Es la confirmación visual del agarre.
+- Desconectado: el brazo queda en reposo y la manga baja a 50 % de saturación. Sin mensajes de error en el mundo.
+- Cerca de la cámara: fade de la mano (no atravesar la cara).
+
+## 8. Contorno de agarre
+
+- Prop dentro del radio de agarre (~12 cm de la palma) → contorno de 2 px en `joy.left`/`joy.right` según la mano. Si ambas manos lo alcanzan, gana la más cercana.
+- Agarrado: contorno sólido. Al soltar/lanzar, desaparece en 150 ms.
+- Un solo contorno por mano a la vez.
+
+## 9. Retroalimentación (háptica y sonido)
+
+Los Joy-Con tienen HD Rumble (SDL `SDL_RumbleGamepad`); úsalo como canal principal, no como adorno.
+- Tocar un prop: pulso ∝ velocidad de impacto (10–40 ms).
+- Agarrar: pulso firme de 40 ms. Lanzar: tick de 15 ms.
+- Sonido: golpes cortos de madera/goma según material del prop. Sin música en M0.
+
+## 10. HUD
+
+- **Tipografía:** M PLUS Rounded 1c (OFL). Por qué: la UI de Switch usa sans redondeada japonesa y sus terminales redondos repiten la forma del Joy-Con. Un peso para texto (500), uno para estado (700). Tamaños: 14 / 18 px a 1080p.
+- **Mapeo espacial:** lo de la mano izquierda vive abajo a la izquierda; lo de la derecha, abajo a la derecha. Como en el control físico.
+- **Estado de conexión:** silueta mínima de cada Joy-Con (rectángulo de cápsula) rellena con su color si está conectado, solo contorno si no, con los Hz debajo. Sin texto "conectado".
+- **Pistas de botones:** íconos con la forma del botón real (círculo para −/+, círculo con anillo para stick), no letras entre corchetes. Se desvanecen tras 10 s sin uso y vuelven al presionar −/+.
+- Texto `ink` sobre una placa `cream` al 85 %, radio 6 px. Sin glassmorphism ni blur.
+- Copia en español, imperativa y corta: «Apunta a la pantalla y presiona − / + para recentrar».
+
+## 11. Ventanas de escritorio (M3–M4)
+
+Las apps son **objetos físicos**, no hologramas: losas de 15 mm de espesor con bisel `ink` y marco `cream`, ~1.2 m de ancho a ~1.8 m de distancia, inclinación solo en yaw. Debajo, una barra de agarre: se mueven con la mano como cualquier prop.
+- Nitidez antes que tamaño: ~0.6–0.7 m por cada 1000 px de ancho, supersampling 1.4×.
+- Puntero: rayo desde la mano, cursor = punto emisivo del color de esa mano. Clic = gatillo con 150 ms de hover estable.
+- Nada de cristal esmerilado ni bordes con glow.
+
+## 12. Anti-objetivos (lo que haría cualquier otro "sandbox de manos")
+
+| Default | En su lugar |
+|---|---|
+| Texturas de prototipo gris con cuadrícula | Madera y menta del cuarto del video |
+| Manos azul holograma / sci-fi | Guante mate + mangas color Joy-Con |
+| Ventanas de vidrio esmerilado con glow | Losas físicas con bisel y barra de agarre |
+| Vacío oscuro con niebla | Terraza de tarde con sombras que leen profundidad |
+| HUD en monoespaciada con etiquetas en mayúsculas | Redondeada, mapeada a cada mano, con siluetas de botones |
+
+## 13. Checklist de validación (por captura)
+
+1. Squint: ¿lo primero que se ve son las dos manos?
+2. Escala de grises: ¿las manos se separan de la mesa y del piso por valor?
+3. ¿La sombra de cada mano se ve sobre la mesa al alcanzar un prop?
+4. ¿Hay algo rojo o azul en el mundo que no sea una mano? Si sí, sobra.
+5. ¿El HUD se lee sin tapar la mesa?
+6. Tapa el título: ¿podría ser otro demo de manos VR? Nombra tres decisiones propias de este.

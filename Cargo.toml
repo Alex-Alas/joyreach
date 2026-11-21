@@ -1,0 +1,27 @@
+[package]
+name = "joyreach"
+version = "0.1.0"
+edition = "2024"
+description = "Joy-Con motion arms in a 3D sandbox on a flat screen — VR-style hands without a headset."
+license = "MIT"
+
+[dependencies]
+bevy = "0.20.1"
+avian3d = "0.8"
+# SDL3 only for gamepad + sensors (Joy-Con IMU). Static build => single .exe (needs CMake + MSVC).
+sdl3-sys = { version = "0.7.3", default-features = false, features = ["build-from-source-static"] }
+
+[features]
+default = ["dev"]
+# Fast incremental builds. Release: `cargo build --release --no-default-features`.
+dev = ["bevy/dynamic_linking"]
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
