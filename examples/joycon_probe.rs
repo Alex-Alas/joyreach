@@ -17,6 +17,10 @@
 //!
 //! `--record` writes every raw IMU sample (`ts_ns,hand,gx,gy,gz,ax,ay,az`) so a real session can
 //! be replayed through `ImuFusion` + `ReachTracker` by the tests.
+//!
+//! Depth (`reach`) is ON by default when `%LOCALAPPDATA%\joyreach\imu_calib.txt` was loaded;
+//! `JOYREACH_REACH=0` forces it off and `=1` forces it on. The probe prints the published reach
+//! next to the part the arm model already explains and the residual dead-reckoned translation.
 
 #[path = "../src/joycon.rs"]
 #[allow(dead_code)]
@@ -487,12 +491,23 @@ fn print_hand(label: &str, hand: &HandInput, debug: &HandDebug) {
         debug.reach_gravity,
     );
     println!(
+        "       model-explained={}  residual={} (cm; residual = dead-reckoned p_imu − model)",
+        fmt_vec3(debug.reach_model_explained * 100.0),
+        fmt_vec3(debug.reach_residual * 100.0),
+    );
+    println!(
         "       depth: {}   ({})",
         if debug.reach_enabled { "ON" } else { "OFF" },
         if debug.reach_enabled {
-            "JOYREACH_REACH=1"
+            if debug.accel_calibrated {
+                "calibración cargada: dead reckoning calibrado"
+            } else {
+                "JOYREACH_REACH=1 fuerza la profundidad sin calibrar"
+            }
+        } else if debug.accel_calibrated {
+            "desactivada por JOYREACH_REACH=0"
         } else {
-            "orientación sola; JOYREACH_REACH=1 activa la profundidad IMU"
+            "sin calibración; corré --calibrate (JOYREACH_REACH=1 la fuerza)"
         }
     );
     println!(
