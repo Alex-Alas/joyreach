@@ -125,6 +125,16 @@ fn fake_hands(mut hands: ResMut<Hands>, mut fake: ResMut<FakeHands>, time: Res<T
         hand.menu = false;
         hand.gyro = Vec3::ZERO;
         hand.accel = Vec3::new(0.0, 9.81, 0.0);
+        // M2a: a slow forward/back reach so screenshots show IMU depth + the IK elbow.
+        // 0..0.35 m forward (-Z), both hands slightly out of phase; the `--screenshot`
+        // moment (~4 s) catches the right arm near full extension.
+        let reach_wave = (t * 0.75 - index as f32 * 0.9).sin();
+        hand.reach = Vec3::new(0.0, 0.02 * reach_wave, -(0.18 + 0.17 * reach_wave));
+        hand.reach_velocity = Vec3::new(
+            0.0,
+            0.0,
+            -0.17 * 0.75 * (t * 0.75 - index as f32 * 0.9).cos(),
+        );
     }
     fake.0 = hands.clone();
 }

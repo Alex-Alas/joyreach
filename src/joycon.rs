@@ -52,6 +52,17 @@ pub struct HandInput {
     /// Calibrated gyro (rad/s) and accel (m/s^2) in body space, for gestures/debug.
     pub gyro: Vec3,
     pub accel: Vec3,
+    /// Hand translation from IMU dead reckoning, in the recentered body frame (metres,
+    /// **-Z forward**, +Y up, +X right). Zero when the hand is at the model's rest pose.
+    ///
+    /// This is how a real push/pull/punch moves the hand: the linear acceleration from the
+    /// accelerometer (minus the per-hand gravity estimate) is integrated with a velocity leak
+    /// and a zero-velocity update while still, so the offset stays where the user stopped it.
+    /// Bounded to ~0.35 m and leaked back toward the rest pose (τ ≈ 3.5 s).
+    /// Reset by recenter and on reconnect.
+    pub reach: Vec3,
+    /// Velocity of [`HandInput::reach`] (body-space m/s), for debug / throw feel.
+    pub reach_velocity: Vec3,
     /// Measured IMU sample rate (Hz), for the HUD.
     pub imu_hz: f32,
 }
@@ -69,6 +80,8 @@ impl Default for HandInput {
             menu: false,
             gyro: Vec3::ZERO,
             accel: Vec3::ZERO,
+            reach: Vec3::ZERO,
+            reach_velocity: Vec3::ZERO,
             imu_hz: 0.0,
         }
     }
@@ -201,6 +214,11 @@ pub struct HandDebug {
     pub body_accel: Vec3,
     pub gyro_bias: Vec3,
     pub bias_ready: bool,
+    /// This hand's measured gravity magnitude (m/s²), used by the reach dead reckoning.
+    pub reach_gravity: f32,
+    /// Reach offset / velocity (body space, metres and m/s).
+    pub reach: Vec3,
+    pub reach_velocity: Vec3,
     pub imu_hz: f32,
     /// SDL errors / unavailable sensors collected while opening this pad.
     pub notes: Vec<String>,
@@ -430,6 +448,7 @@ fn sdl_thread_main(
         if recenter {
             for rt in pads.iter_mut().flat_map(|p| [p.left.as_mut(), p.right.as_mut()]).flatten() {
                 rt.fusion.recenter();
+                rt.reach.reset();
                 rt.input.orientation = rt.fusion.orientation();
             }
         }
@@ -631,6 +650,7 @@ fn send_pad_rumble(pad: &mut Pad, state: &RumbleState, now: Instant) -> bool {
 struct HandRuntime {
     input: HandInput,
     fusion: ImuFusion,
+    reach: ReachTracker,
     /// Last raw sample, SDL device frame.
     last_gyro: Vec3,
     last_accel: Vec3,
@@ -648,6 +668,7 @@ impl HandRuntime {
                 ..Default::default()
             },
             fusion: ImuFusion::new(),
+            reach: ReachTracker::new(),
             last_gyro: Vec3::ZERO,
             last_accel: Vec3::ZERO,
             pending_gyro: None,
@@ -893,6 +914,13 @@ fn handle_sensor(event: &SDL_Event, pads: &mut [Pad]) {
             _ => rt.last_gyro,
         };
         rt.fusion.push(gyro, value, ts);
+        // Reach runs at IMU rate next to the fusion, using the freshly updated orientation.
+        rt.reach.push(
+            device_to_body(value),
+            device_to_body(gyro) - rt.fusion.bias,
+            rt.fusion.orientation(),
+            ts,
+        );
     }
 }
 
@@ -965,6 +993,8 @@ unsafe fn poll_pad(pad: &mut Pad) -> bool {
         rt.input.orientation = rt.fusion.orientation();
         rt.input.gyro = device_to_body(rt.last_gyro) - rt.fusion.bias;
         rt.input.accel = device_to_body(rt.last_accel);
+        rt.input.reach = rt.reach.offset;
+        rt.input.reach_velocity = rt.reach.velocity;
         rt.input.imu_hz = rt.fusion.hz;
     }
     recenter
@@ -1017,6 +1047,9 @@ impl Pad {
             body_accel: device_to_body(rt.last_accel),
             gyro_bias: rt.fusion.bias,
             bias_ready: rt.fusion.bias_ready,
+            reach_gravity: rt.reach.gravity,
+            reach: rt.reach.offset,
+            reach_velocity: rt.reach.velocity,
             imu_hz: rt.fusion.hz,
             notes: self.notes.clone(),
             sensors: Vec::new(),
@@ -1286,6 +1319,203 @@ impl ImuFusion {
     /// Final orientation for `HandInput`: body space with a recentered heading.
     fn orientation(&self) -> Quat {
         (self.yaw_offset * self.q).normalize()
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Reach (IMU dead reckoning of hand translation)
+// ---------------------------------------------------------------------------------------------
+
+/// Deadband on the linear acceleration (m/s²): sensor noise below this is ignored, so a hand
+/// resting on a table does not creep.
+const REACH_DEADBAND: f32 = 0.15;
+/// Velocity leak time constant (s). Truncates the velocity error left over by an imperfect
+/// gravity subtraction, so it never turns into a constant drift.
+const REACH_VELOCITY_TAU: f32 = 0.5;
+/// Slow leak of the accumulated offset back to the model's rest pose (s): bounds drift without
+/// snapping the hand back (a full reach decays to ~1/e in 3.5 s).
+const REACH_LEAK_TAU: f32 = 3.5;
+/// Maximum published offset (m). Beyond a real arm's extra travel, so clamping also protects
+/// the arm IK from absurd targets.
+const REACH_MAX: f32 = 0.35;
+/// Scale from integrated position to published reach. 1.0 = metres of real hand travel.
+const REACH_GAIN: f32 = 1.0;
+/// Short stillness window for the zero-velocity update (ns).
+const REACH_STILL_NS: u64 = 60_000_000;
+/// Still = mean |gyro| below this (rad/s)...
+const REACH_STILL_GYRO: f32 = 0.25;
+/// ...and accel direction/magnitude steady: std dev of the accel vector below this (m/s²).
+const REACH_STILL_ACCEL_STD: f32 = 0.35;
+/// A quiet window whose mean |accel| differs from the learned gravity by more than this is a
+/// steady push, not rest (e.g. a 4 m/s² horizontal push reads 9.76 vs 8.89 m/s²).
+const REACH_STILL_GRAVITY_BAND: f32 = 0.5;
+
+/// Per-hand dead reckoning of the hand's translation from the accelerometer.
+///
+/// `a_lin = (yaw_offset · q) · accel − ĝ·Y`, where `ĝ` is this hand's measured gravity
+/// magnitude (Joy-Cons differ: ~10.06 m/s² for the left one and ~8.89 for the right one;
+/// subtracting a fixed 9.81 makes one hand sink and the other rise forever).
+///
+/// Integration is kept honest by three mechanisms, all in the spirit of pedestrian
+/// dead reckoning:
+/// * a deadband + velocity leak (τ = 0.5 s) so small errors die instead of accumulating;
+/// * **ZUPT**: after ~60 ms of stillness (low gyro, steady accel, |a| ≈ ĝ) the velocity is set
+///   to zero, so the hand *stays* exactly where the user stopped it — punching a prop and
+///   freezing leaves the arm extended;
+/// * the offset is clamped and slowly leaked back to the model pose (τ = 3.5 s), which bounds
+///   the unavoidable drift of dead reckoning.
+///
+/// `ĝ` is learned from the first quiet window (~60 ms after connect, before which reach is 0)
+/// and refined while still. Recenering the yaw resets the offset and velocity.
+#[derive(Debug)]
+struct ReachTracker {
+    /// Recentered body-space offset (metres, -Z forward).
+    offset: Vec3,
+    velocity: Vec3,
+    /// This hand's gravity magnitude, from its still windows.
+    gravity: f32,
+    gravity_ready: bool,
+    /// Set while the last completed stillness window was quiet.
+    still: bool,
+    last_ts: Option<u64>,
+    win_start: Option<u64>,
+    win_n: u32,
+    win_a: Vec3,
+    win_a2: Vec3,
+    win_g: f32,
+}
+
+impl ReachTracker {
+    fn new() -> Self {
+        Self {
+            offset: Vec3::ZERO,
+            velocity: Vec3::ZERO,
+            gravity: GRAVITY,
+            gravity_ready: false,
+            still: false,
+            last_ts: None,
+            win_start: None,
+            win_n: 0,
+            win_a: Vec3::ZERO,
+            win_a2: Vec3::ZERO,
+            win_g: 0.0,
+        }
+    }
+
+    /// Back to the model pose (recenter / reconnect).
+    fn reset(&mut self) {
+        self.offset = Vec3::ZERO;
+        self.velocity = Vec3::ZERO;
+        self.still = false;
+    }
+
+    /// One IMU sample. `accel`/`gyro` are body space; `orientation` is the yaw-recentered
+    /// body→world rotation (`ImuFusion::orientation()`).
+    fn push(&mut self, accel: Vec3, gyro: Vec3, orientation: Quat, ts_ns: u64) {
+        let dt = match self.last_ts {
+            None => None,
+            Some(last) => {
+                let delta = ts_ns.saturating_sub(last);
+                if delta == 0 || delta > DT_MAX_NS {
+                    None
+                } else {
+                    Some(delta as f32 * 1e-9)
+                }
+            }
+        };
+        self.last_ts = Some(ts_ns);
+
+        // Moving again after a still spell: integrate immediately and start a fresh stillness
+        // window, so samples from before the push can't re-assert "still" mid-motion.
+        if self.still
+            && (gyro.length() > REACH_STILL_GYRO * 2.0
+                || (accel.length() - self.gravity).abs() > REACH_STILL_GRAVITY_BAND * 2.0)
+        {
+            self.still = false;
+            self.reset_window();
+        }
+
+        self.update_stillness(accel, gyro, ts_ns);
+
+        let Some(dt) = dt else {
+            return;
+        };
+        if !self.gravity_ready {
+            // No per-hand gravity estimate yet (the first ~60 ms after connect): hold at zero.
+            return;
+        }
+
+        // The slow leak runs even while the hand is still, so a deliberate reach decays back
+        // toward the model pose (τ = 3.5 s) and a bump cannot leave the arm displaced forever.
+        self.offset *= (-dt / REACH_LEAK_TAU).exp();
+
+        if self.still {
+            // ZUPT already zeroed the velocity when the still window completed; just hold
+            // position (apart from the slow leak).
+            self.offset = self.offset.clamp_length_max(REACH_MAX);
+            return;
+        }
+
+        let mut linear = orientation * accel - Vec3::Y * self.gravity;
+        linear *= REACH_GAIN;
+        if linear.length() < REACH_DEADBAND {
+            linear = Vec3::ZERO;
+        }
+
+        self.velocity += linear * dt;
+        self.velocity *= (-dt / REACH_VELOCITY_TAU).exp();
+
+        self.offset += self.velocity * dt;
+        // Bound both drift and the distance the physical arm has to travel.
+        self.offset = self.offset.clamp_length_max(REACH_MAX);
+    }
+
+    /// The ~60 ms stillness test shared by the gravity estimate and the ZUPT.
+    fn update_stillness(&mut self, accel: Vec3, gyro: Vec3, ts_ns: u64) {
+        let start = *self.win_start.get_or_insert(ts_ns);
+        self.win_n += 1;
+        self.win_a += accel;
+        self.win_a2 += accel * accel;
+        self.win_g += gyro.length();
+        if ts_ns.saturating_sub(start) < REACH_STILL_NS {
+            return;
+        }
+
+        let n = self.win_n as f32;
+        let mean_a = self.win_a / n;
+        let variance = (self.win_a2 / n - mean_a * mean_a).max(Vec3::ZERO).element_sum();
+        let quiet = self.win_n >= 5
+            && self.win_g / n < REACH_STILL_GYRO
+            && variance.sqrt() < REACH_STILL_ACCEL_STD;
+        let magnitude = mean_a.length();
+
+        if quiet && !self.gravity_ready {
+            // First quiet window after connect: this is what "1 g" means for this Joy-Con.
+            self.gravity = magnitude;
+            self.gravity_ready = true;
+            self.offset = Vec3::ZERO;
+            self.velocity = Vec3::ZERO;
+            eprintln!("[joycon] reach gravity calibrated: {magnitude:.2} m/s^2");
+        } else if quiet && (magnitude - self.gravity).abs() < REACH_STILL_GRAVITY_BAND {
+            // Refine ĝ slowly so temperature/scale changes don't turn into drift.
+            self.gravity += (magnitude - self.gravity) * 0.2;
+        }
+
+        self.still = quiet && (magnitude - self.gravity).abs() < REACH_STILL_GRAVITY_BAND;
+        if self.still {
+            // Zero-velocity update: hold the position the user stopped at.
+            self.velocity = Vec3::ZERO;
+        }
+
+        self.reset_window();
+    }
+
+    fn reset_window(&mut self) {
+        self.win_start = None;
+        self.win_n = 0;
+        self.win_a = Vec3::ZERO;
+        self.win_a2 = Vec3::ZERO;
+        self.win_g = 0.0;
     }
 }
 
@@ -1593,5 +1823,154 @@ mod tests {
         assert_vec3(fusion.bias, Vec3::ZERO, 1e-4);
         let yaw = fusion.q.to_euler(EulerRot::YXZ).0;
         assert!((yaw - 0.6).abs() < 0.02, "expected 0.6 rad of yaw, got {yaw}");
+    }
+
+    // --- Reach (dead reckoning) -----------------------------------------------
+
+    /// Feed the reach tracker at 200 Hz with a body-space linear acceleration added to rest
+    /// gravity; `orientation` stays identity (yaw already recentered, hand level).
+    fn feed_reach(
+        reach: &mut ReachTracker,
+        gravity: f32,
+        linear: impl Fn(f32) -> Vec3,
+        seconds: f32,
+        ts: &mut u64,
+    ) {
+        let samples = (seconds * 200.0) as u32;
+        for i in 0..samples {
+            let t = i as f32 / 200.0;
+            let accel = Vec3::Y * gravity + linear(t);
+            reach.push(accel, Vec3::ZERO, Quat::IDENTITY, *ts);
+            *ts += 5_000_000;
+        }
+    }
+
+    /// The Joy-Con R at rest measures ~8.89 m/s², not 9.81. Subtracting a fixed 9.81 would make
+    /// the hand sink forever; the per-hand ĝ must learn the real value and stay put.
+    #[test]
+    fn reach_at_rest_does_not_drift_with_misscaled_gravity() {
+        let mut reach = ReachTracker::new();
+        let mut ts = 0u64;
+        let noise = |i: u32| {
+            let d = (i % 7) as f32 - 3.0;
+            Vec3::new(d * 0.004, d * 0.006, -d * 0.004)
+        };
+        let mut sample = 0u32;
+        // 10 s at rest with 8.9 m/s² of measured gravity, like the right Joy-Con on a table.
+        for _ in 0..2000 {
+            let accel = Vec3::Y * 8.9 + noise(sample);
+            reach.push(accel, Vec3::ZERO, Quat::IDENTITY, ts);
+            ts += 5_000_000;
+            sample += 1;
+        }
+        assert!(reach.gravity_ready, "the first quiet window should set ĝ");
+        assert!(
+            (reach.gravity - 8.9).abs() < 0.05,
+            "ĝ should learn 8.9, got {}",
+            reach.gravity
+        );
+        assert!(
+            reach.offset.length() < 0.01,
+            "hand must stay put at rest, offset {}",
+            reach.offset
+        );
+    }
+
+    /// Accelerate forward, decelerate to a stop: the hand travels ~0.3 m forward (−Z) and
+    /// the ZUPT then holds it there instead of letting it snap back or keep sliding.
+    #[test]
+    fn reach_forward_push_moves_then_holds() {
+        let mut reach = ReachTracker::new();
+        let mut ts = 0u64;
+        // 0.5 s quiet so ĝ is learned at 9.81.
+        feed_reach(&mut reach, GRAVITY, |_| Vec3::ZERO, 0.5, &mut ts);
+
+        // 0.35 s accelerating forward at 5 m/s², then just enough braking (−5 m/s² for
+        // 0.22 s) to stop at the end: a realistic ~0.3 m push.
+        let push = |t: f32| {
+            if t < 0.35 {
+                Vec3::NEG_Z * 5.0
+            } else if t < 0.57 {
+                Vec3::Z * 5.0
+            } else {
+                Vec3::ZERO
+            }
+        };
+        feed_reach(&mut reach, GRAVITY, push, 0.7, &mut ts);
+        let after_push = reach.offset;
+        assert!(
+            after_push.z < -0.2,
+            "a forward push should move the hand forward, got {after_push}"
+        );
+        assert!(
+            after_push.x.abs() < 0.02 && after_push.y.abs() < 0.02,
+            "the push is forward only, got {after_push}"
+        );
+
+        // 1 s still: ZUPT froze the reach, the slow leak may only shave a few cm.
+        feed_reach(&mut reach, GRAVITY, |_| Vec3::ZERO, 1.0, &mut ts);
+        assert_eq!(reach.velocity, Vec3::ZERO, "ZUPT should zero the velocity");
+        assert!(
+            reach.offset.z < -0.2,
+            "the hand must stay extended after stopping, got {}",
+            reach.offset
+        );
+
+        // And the leak is slow: a couple of seconds later it is still readable.
+        feed_reach(&mut reach, GRAVITY, |_| Vec3::ZERO, 0.5, &mut ts);
+        assert!(
+            reach.offset.z < -0.15,
+            "leak should be slow, got {}",
+            reach.offset
+        );
+
+        // But it does run: after ~10 s at rest the hand is back near the model pose, so the
+        // unavoidable drift is bounded instead of accumulating forever.
+        feed_reach(&mut reach, GRAVITY, |_| Vec3::ZERO, 10.0, &mut ts);
+        assert!(
+            reach.offset.length() < 0.02,
+            "the offset should leak back to the model pose, got {}",
+            reach.offset
+        );
+    }
+
+    /// Sensor noise and a skewed gravity estimate must not random-walk the hand away.
+    #[test]
+    fn reach_long_noisy_still_stays_bounded() {
+        let mut reach = ReachTracker::new();
+        let mut ts = 0u64;
+        feed_reach(&mut reach, GRAVITY, |_| Vec3::ZERO, 0.2, &mut ts);
+        for i in 0..12_000u32 {
+            // ±0.4 m/s² of per-axis noise, a bit of gyro jitter: still a resting hand.
+            let n = |k: u32| {
+                ((i.wrapping_mul(2654435761).wrapping_add(k) % 1000) as f32 / 999.0 - 0.5) * 0.8
+            };
+            let accel = Vec3::new(n(1), GRAVITY + n(2), n(3));
+            let gyro = Vec3::new(n(4), n(5), n(6)) * 0.05;
+            reach.push(accel, gyro, Quat::IDENTITY, ts);
+            ts += 5_000_000;
+            assert!(
+                reach.offset.length() <= REACH_MAX + 1e-4,
+                "offset escaped its clamp at sample {i}: {}",
+                reach.offset
+            );
+        }
+        assert!(
+            reach.offset.length() < 0.02,
+            "a noisy resting hand should stay near zero, got {}",
+            reach.offset
+        );
+    }
+
+    #[test]
+    fn reach_recenter_resets_the_offset() {
+        let mut reach = ReachTracker::new();
+        let mut ts = 0u64;
+        feed_reach(&mut reach, GRAVITY, |_| Vec3::ZERO, 0.5, &mut ts);
+        feed_reach(&mut reach, GRAVITY, |_| Vec3::NEG_Z * 8.0, 0.3, &mut ts);
+        assert!(reach.offset.length() > 0.01);
+        reach.reset();
+        assert_eq!(reach.offset, Vec3::ZERO);
+        assert_eq!(reach.velocity, Vec3::ZERO);
     }
 }

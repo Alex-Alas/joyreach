@@ -23,12 +23,16 @@ use crate::theme;
 pub const GRAB_RADIUS: f32 = 0.12;
 /// Cap on the force the hand may use to hold a prop. Acceleration = force / mass, so
 /// a heavier prop lags behind the hand while a light one tracks it tightly.
-pub const MAX_GRAB_FORCE: f32 = 400.0;
+/// Realistic masses (0.2–0.8 kg props, ~3 kg crates) mean 60 N is snappy on a prop but
+/// visibly lags on a crate — and still beats the crate's ~29 N of weight.
+pub const MAX_GRAB_FORCE: f32 = 60.0;
 /// Cap on the torque used to twist a held prop (N·m).
 pub const MAX_GRAB_TORQUE: f32 = 8.0;
 /// Throw speed = average hand velocity over the last [`THROW_SAMPLES`] fixed steps × gain.
-/// The 3DoF arm model moves the hand far less than a real one, hence the gain.
-pub const THROW_GAIN: f32 = 1.6;
+/// Since M2a the hand velocity includes the real IMU reach, so it needs much less help.
+pub const THROW_GAIN: f32 = 1.1;
+/// How fast a grabbed prop is pulled into the palm (s). ~80 ms settle, DESIGN §7.
+pub const GRIP_SNAP_TAU: f32 = 0.03;
 pub const THROW_MAX_SPEED: f32 = 12.0;
 pub const THROW_MAX_SPIN: f32 = 12.0;
 pub const THROW_SAMPLES: usize = 5;
@@ -111,6 +115,33 @@ pub fn outline_scale(half_extent: f32) -> f32 {
 /// Distance from `point` to a prop's collider surface (0 when inside).
 pub fn palm_to_prop(point: Vec3, translation: Vec3, rotation: Quat, collider: &Collider) -> f32 {
     collider.distance_to_point(translation, rotation, point, true)
+}
+
+/// Half the prop's size along `direction` (world space): the distance from its centre to the
+/// surface on that side. Cast from the centre outward; a ray that starts inside a non-solid
+/// shape stops at the boundary, which is exactly the half extent (sphere radius, cuboid half
+/// side along that axis, ...).
+pub fn half_extent_along(
+    collider: &Collider,
+    translation: Vec3,
+    rotation: Quat,
+    direction: Vec3,
+) -> f32 {
+    let direction = direction.normalize_or_zero();
+    if direction == Vec3::ZERO {
+        return 0.05;
+    }
+    collider
+        .cast_ray(translation, rotation, translation, direction, 1.0, false)
+        .map(|(toi, _)| toi)
+        .filter(|toi| toi.is_finite() && *toi > 1e-4)
+        .unwrap_or(0.05)
+}
+
+/// Hand-space offset that puts the prop's centre on the palm surface, right under the palm
+/// centre: the palm faces local −Y (same frame as the glove, whose back is +Y).
+pub fn grip_offset(half_size: f32) -> Vec3 {
+    Vec3::NEG_Y * half_size.max(0.01)
 }
 
 // --- Outline material / children ---------------------------------------------
@@ -199,8 +230,10 @@ pub struct Grabbable;
 #[derive(Clone, Copy, Debug)]
 struct HeldProp {
     entity: Entity,
-    /// Prop centre in hand space, captured at grab time.
+    /// Prop centre in hand space: starts where the hand found it and eases into `grip`.
     offset: Vec3,
+    /// Where the prop should sit once the grab settles (in the palm).
+    grip: Vec3,
     /// Prop orientation in hand space, captured at grab time.
     rotation_offset: Quat,
 }
@@ -396,10 +429,16 @@ fn drive_grabs(
                 HandSide::Right => right_candidate,
             };
             if let Some(entity) = candidate {
-                if let Ok((position, rotation, ..)) = props.get(entity) {
+                if let Ok((position, rotation, _, _, _, _, collider)) = props.get(entity) {
+                    // Pull the prop into the palm over ~80 ms: its centre goes to the palm
+                    // surface on the palm side, so it reads as held instead of hovering
+                    // 12–14 cm away (DESIGN §7).
+                    let palm_normal = palm_rotation * Vec3::NEG_Y;
+                    let half_size = half_extent_along(collider, position.0, rotation.0, palm_normal);
                     hand.held = Some(HeldProp {
                         entity,
                         offset: palm_rotation.inverse() * (position.0 - palm),
+                        grip: grip_offset(half_size),
                         rotation_offset: palm_rotation.inverse() * rotation.0,
                     });
                     commands
@@ -421,6 +460,14 @@ fn drive_grabs(
             }
         }
 
+        if hand.held.is_none() {
+            continue;
+        }
+        // Ease the capture offset into the palm (grip snap).
+        if let Some(held) = hand.held.as_mut() {
+            let blend = 1.0 - (-dt / GRIP_SNAP_TAU).exp();
+            held.offset = held.offset.lerp(held.grip, blend);
+        }
         let Some(held) = hand.held else {
             continue;
         };
@@ -688,10 +735,10 @@ mod tests {
     #[test]
     fn throw_averages_samples_scales_and_clamps() {
         let samples = [Vec3::new(1.0, 0.0, 0.0), Vec3::new(3.0, 0.0, 0.0)];
-        // Average 2 m/s × 1.6 = 3.2 m/s.
+        // Average 2 m/s × THROW_GAIN.
         assert!(
             (throw_velocity(&samples, THROW_GAIN, THROW_MAX_SPEED)
-                - Vec3::new(3.2, 0.0, 0.0))
+                - Vec3::new(2.0 * THROW_GAIN, 0.0, 0.0))
             .length()
                 < 1e-5
         );
@@ -701,6 +748,24 @@ mod tests {
                 < 1e-5
         );
         assert_eq!(throw_velocity(&[], THROW_GAIN, THROW_MAX_SPEED), Vec3::ZERO);
+    }
+
+    #[test]
+    fn grip_half_extent_is_the_surface_distance_from_the_centre() {
+        let sphere = Collider::sphere(0.06);
+        let half = half_extent_along(&sphere, Vec3::ZERO, Quat::IDENTITY, Vec3::Y);
+        assert!((half - 0.06).abs() < 1e-3, "sphere half extent {half}");
+
+        // A 10 cm cube: 5 cm to the face whatever the rotation, along a face normal.
+        let cube = Collider::cuboid(0.10, 0.10, 0.10);
+        let half = half_extent_along(&cube, Vec3::ZERO, Quat::IDENTITY, Vec3::Y);
+        assert!((half - 0.05).abs() < 1e-3, "cube half extent {half}");
+        let half = half_extent_along(&cube, Vec3::ZERO, Quat::IDENTITY, Vec3::X);
+        assert!((half - 0.05).abs() < 1e-3, "cube half extent along X {half}");
+
+        // And the grip sits under the palm centre, on the palm side (−Y of the hand).
+        let grip = grip_offset(0.05);
+        assert!((grip - Vec3::new(0.0, -0.05, 0.0)).length() < 1e-6);
     }
 
     #[test]

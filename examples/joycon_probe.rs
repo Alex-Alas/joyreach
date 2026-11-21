@@ -174,6 +174,17 @@ fn print_hand(label: &str, hand: &HandInput, debug: &HandDebug) {
         yaw, pitch, roll
     );
     println!(
+        "       reach=({:+.1},{:+.1},{:+.1}) cm (x,y,z; z- = forward)  \
+         vel=({:+.2},{:+.2},{:+.2}) m/s  g_hat={:.2} m/s2",
+        hand.reach.x * 100.0,
+        hand.reach.y * 100.0,
+        hand.reach.z * 100.0,
+        hand.reach_velocity.x,
+        hand.reach_velocity.y,
+        hand.reach_velocity.z,
+        debug.reach_gravity,
+    );
+    println!(
         "       stick=({:+.2},{:+.2})  {}={} {}={}  face={}  menu={} click={}",
         hand.stick.x,
         hand.stick.y,

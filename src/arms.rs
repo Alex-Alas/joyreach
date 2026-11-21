@@ -61,6 +61,15 @@ const FOREARM_RADIUS: f32 = 0.036;
 const ELBOW_RADIUS: f32 = 0.052;
 const WRIST_RADIUS: f32 = 0.033;
 
+/// Upper arm is hidden while its shoulder is this close to the eye: at 80° FOV a 10 cm
+/// sleeve 20 cm from the camera covers a whole bottom corner of the frame (M2a fix).
+const UPPER_NEAR_HIDE: f32 = 0.30;
+/// Fully visible once the upper arm clears this distance from the eye.
+const UPPER_NEAR_SHOW: f32 = 0.52;
+
+/// Defensive clamp for the reach offset fed into the IK (the input already clamps it).
+const REACH_IK_MAX: f32 = 0.35;
+
 /// Which physical hand a chain belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HandSide {
@@ -168,6 +177,74 @@ pub fn solve_arm(side: HandSide, orientation: Quat) -> ArmPose {
 /// 0 while looking level or up; grows linearly from −20° to full lean at −60°.
 pub fn lean_ratio(pitch: f32) -> f32 {
     ((-pitch - LEAN_START) / LEAN_RANGE).clamp(0.0, 1.0)
+}
+
+/// Analytic two-bone IK from the shoulder to a desired wrist position.
+///
+/// Returns `(wrist, elbow)`. The wrist is clamped to the real segment lengths (the arm can
+/// neither stretch nor collapse), and the elbow bends in the plane of the pole hint, which
+/// points down and outward so elbows hang like real ones instead of poking into the chest.
+fn two_bone_ik(side: HandSide, shoulder: Vec3, target: Vec3) -> (Vec3, Vec3) {
+    // GvrArmModel segment lengths, measured from the model itself (metres).
+    let upper = (ELBOW_REST - SHOULDER).length();
+    let fore = WRIST_REST.length();
+    let max_reach = upper + fore - 1e-3;
+    let min_reach = (upper - fore).abs() + 1e-3;
+
+    let delta = target - shoulder;
+    let distance = delta.length();
+    let direction = if distance > 1e-5 {
+        delta / distance
+    } else {
+        Vec3::NEG_Z
+    };
+    let distance = distance.clamp(min_reach, max_reach);
+    let wrist = shoulder + direction * distance;
+
+    // Law of cosines: distance from the shoulder to the elbow's projection on the bone.
+    let along = (upper * upper - fore * fore + distance * distance) / (2.0 * distance);
+    let height = (upper * upper - along * along).max(0.0).sqrt();
+
+    let hint = Vec3::new(0.55 * side.sign_x(), -1.0, 0.20);
+    let mut pole = hint - direction * hint.dot(direction);
+    if pole.length_squared() < 1e-6 {
+        // Straight up/down target: fall back to the body's outward axis.
+        pole = Vec3::X * side.sign_x();
+        pole -= direction * pole.dot(direction);
+    }
+    let pole = pole.normalize_or_zero();
+    let elbow = shoulder + direction * along + pole * height;
+
+    (wrist, elbow)
+}
+
+/// [`solve_arm`] plus the IMU reach offset: the wrist is displaced and the elbow re-solved
+/// with two-bone IK, so a real push/pull moves the whole arm instead of only the hand.
+pub fn solve_arm_with_reach(side: HandSide, orientation: Quat, reach: Vec3) -> ArmPose {
+    let base = solve_arm(side, orientation);
+    let reach = reach.clamp_length_max(REACH_IK_MAX);
+    if reach.length_squared() < 1e-8 {
+        return base;
+    }
+
+    let handed = Vec3::new(side.sign_x(), 1.0, 1.0);
+    let (wrist, elbow) = two_bone_ik(side, base.shoulder, base.wrist + reach);
+    let hand = wrist + base.hand_rotation * (CONTROLLER_REST * handed);
+
+    let rest_upper = (ELBOW_REST - SHOULDER).normalize();
+    let rest_fore = WRIST_REST.normalize();
+    let elbow_rotation = Quat::from_rotation_arc(rest_upper, (elbow - base.shoulder).normalize());
+    let wrist_rotation = Quat::from_rotation_arc(rest_fore, (wrist - elbow).normalize());
+
+    ArmPose {
+        shoulder: base.shoulder,
+        elbow,
+        wrist,
+        hand,
+        elbow_rotation,
+        wrist_rotation,
+        hand_rotation: base.hand_rotation,
+    }
 }
 
 /// Body-space offset of the arm-chain anchor for a camera pitch.
@@ -288,6 +365,8 @@ pub struct HandBody {
 struct HandState {
     pose: Option<ArmPose>,
     connected: bool,
+    /// How visible the upper arm is (0 = shoulder next to the camera, 1 = clear of it).
+    upper_fade: f32,
 }
 
 fn sleeve_material(color: Color) -> StandardMaterial {
@@ -463,9 +542,22 @@ fn update_lean(
     }
 }
 
+/// How visible the upper arm should be: hidden while its shoulder is right next to the camera,
+/// full strength once it clears [`UPPER_NEAR_SHOW`]. Smoothstepped.
+///
+/// `lean` is the current torso lean: the arm root sits at `eye + ARM_ANCHOR_OFFSET + lean`, so
+/// the camera is at `-(ARM_ANCHOR_OFFSET + lean)` in the pose's space.
+fn upper_fade(pose: &ArmPose, lean: Vec3) -> f32 {
+    let eye = -(ARM_ANCHOR_OFFSET + lean);
+    let clearance = point_segment_distance(eye, pose.shoulder, pose.elbow);
+    let t = ((clearance - UPPER_NEAR_HIDE) / (UPPER_NEAR_SHOW - UPPER_NEAR_HIDE)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 fn update_arms(
     time: Res<Time>,
     hands: Res<Hands>,
+    lean: Res<ArmLean>,
     mut curl: ResMut<HandCurl>,
     mut roots: Query<(&ArmRoot, &mut ArmAnim)>,
     mut parts: Query<(&ArmPart, &mut Transform)>,
@@ -491,9 +583,16 @@ fn update_arms(
         } else {
             Quat::IDENTITY
         };
+        let reach = if input.connected {
+            input.reach
+        } else {
+            Vec3::ZERO
+        };
+        let pose = solve_arm_with_reach(root.side, orientation, reach);
         states[root.side.index()] = HandState {
-            pose: Some(solve_arm(root.side, orientation)),
+            pose: Some(pose),
             connected: input.connected,
+            upper_fade: upper_fade(&pose, lean.offset),
         };
     }
 
@@ -503,7 +602,18 @@ fn update_arms(
                 let Some(pose) = states[side.index()].pose else {
                     continue;
                 };
-                segment(&mut transform, pose.shoulder, pose.elbow, UPPER_RADIUS);
+                // The shoulder sits right next to the camera (0.2 m at rest), where a 10 cm
+                // sleeve is a huge blob in the bottom corner. Fade it out while it is that
+                // close: the elbow and forearm already read as coming from below the frame,
+                // and leaning forward / reaching (when the shoulder clears ~0.5 m) brings it
+                // back.
+                let fade = states[side.index()].upper_fade;
+                if fade <= 1e-4 {
+                    transform.scale = Vec3::ZERO;
+                } else {
+                    segment(&mut transform, pose.shoulder, pose.elbow, UPPER_RADIUS * fade);
+                    transform.scale.y *= fade;
+                }
             }
             ArmPart::Fore(side) => {
                 let Some(pose) = states[side.index()].pose else {
@@ -515,9 +625,14 @@ fn update_arms(
                 let Some(pose) = states[side.index()].pose else {
                     continue;
                 };
+                // A big joint ball only makes sense when the upper arm is there to hide the
+                // seam. With the upper arm hidden, match the forearm radius so the elbow is not
+                // a red/blue blob bigger than the arm itself.
+                let fade = states[side.index()].upper_fade;
+                let radius = FOREARM_RADIUS + (ELBOW_RADIUS - FOREARM_RADIUS) * fade;
                 transform.translation = pose.elbow;
                 transform.rotation = pose.elbow_rotation;
-                transform.scale = Vec3::splat(ELBOW_RADIUS);
+                transform.scale = Vec3::splat(radius);
             }
             ArmPart::Wrist(side) => {
                 let Some(pose) = states[side.index()].pose else {
@@ -763,6 +878,17 @@ fn inverse_transform(transform: Transform) -> Transform {
     }
 }
 
+/// Distance from `point` to the segment `from`→`to`.
+fn point_segment_distance(point: Vec3, from: Vec3, to: Vec3) -> f32 {
+    let delta = to - from;
+    let length_squared = delta.length_squared();
+    if length_squared < 1e-9 {
+        return (point - from).length();
+    }
+    let t = ((point - from).dot(delta) / length_squared).clamp(0.0, 1.0);
+    (point - (from + delta * t)).length()
+}
+
 /// Place a unit-height cylinder (radius 0.5, height 1) between two points.
 fn segment(transform: &mut Transform, from: Vec3, to: Vec3, radius: f32) {
     let delta = to - from;
@@ -806,7 +932,12 @@ fn drive_hand_bodies(
         } else {
             Quat::IDENTITY
         };
-        let pose = solve_arm(hand.side, orientation);
+        let reach = if input.connected {
+            input.reach
+        } else {
+            Vec3::ZERO
+        };
+        let pose = solve_arm_with_reach(hand.side, orientation, reach);
 
         let target_position =
             body.transform_point(Vec3::Y * EYE_HEIGHT + ARM_ANCHOR_OFFSET + lean.offset + pose.hand);
@@ -980,5 +1111,109 @@ mod tests {
         // And further forward than the neutral hover, so low floor props are reachable.
         let neutral = hand_world_space(solve_arm(HandSide::Right, Quat::IDENTITY));
         assert!(hand.z < neutral.z - 0.2);
+    }
+
+    // --- Reach offset + two-bone IK -------------------------------------------
+
+    fn segment_lengths() -> (f32, f32) {
+        ((ELBOW_REST - SHOULDER).length(), WRIST_REST.length())
+    }
+
+    #[test]
+    fn reach_within_the_arm_reaches_the_displaced_wrist() {
+        let base = solve_arm(HandSide::Right, Quat::IDENTITY);
+        let reach = Vec3::new(0.0, 0.0, -0.06);
+        let pose = solve_arm_with_reach(HandSide::Right, Quat::IDENTITY, reach);
+
+        // The wrist follows the target exactly while it is within reach...
+        assert!(
+            (pose.wrist - (base.wrist + reach)).length() < 1e-3,
+            "wrist {:?} should be {:?}",
+            pose.wrist,
+            base.wrist + reach
+        );
+        // ...the bones keep their lengths...
+        let (upper, fore) = segment_lengths();
+        assert!(((pose.elbow - pose.shoulder).length() - upper).abs() < 1e-3);
+        assert!(((pose.wrist - pose.elbow).length() - fore).abs() < 1e-3);
+        // ...and the palm stays 5 cm past the wrist, in the hand's local -Z.
+        assert!(
+            (pose.hand - (pose.wrist + pose.hand_rotation * CONTROLLER_REST)).length() < 1e-5,
+            "hand {:?} should hang off wrist {:?}",
+            pose.hand,
+            pose.wrist
+        );
+    }
+
+    #[test]
+    fn reach_beyond_the_arm_is_clamped_to_the_real_reach() {
+        let (upper, fore) = segment_lengths();
+        let max_reach = upper + fore;
+        let pose = solve_arm_with_reach(
+            HandSide::Right,
+            Quat::IDENTITY,
+            Vec3::new(0.0, 0.0, -REACH_IK_MAX),
+        );
+        let distance = (pose.wrist - pose.shoulder).length();
+        assert!(
+            distance <= max_reach + 1e-3,
+            "the arm stretched to {distance} m (max {max_reach})"
+        );
+        assert!(
+            distance > max_reach - 0.01,
+            "a far target should fully extend the arm, got {distance}"
+        );
+        // Still a valid two-bone solution.
+        assert!(((pose.wrist - pose.elbow).length() - fore).abs() < 1e-3);
+    }
+
+    #[test]
+    fn ik_elbow_hangs_below_the_shoulder_wrist_line() {
+        let pose = solve_arm_with_reach(
+            HandSide::Right,
+            Quat::IDENTITY,
+            Vec3::new(0.0, 0.0, -0.15),
+        );
+        let line = pose.wrist - pose.shoulder;
+        let t = (pose.elbow - pose.shoulder).dot(line) / line.length_squared();
+        let line_point = pose.shoulder + line * t;
+        assert!(
+            pose.elbow.y < line_point.y - 1e-3,
+            "elbow {:?} should hang below the line point {:?}",
+            pose.elbow,
+            line_point
+        );
+        // The pole also pushes it outward, like a real elbow (never across the chest).
+        assert!(
+            pose.elbow.x > pose.shoulder.x - 0.02,
+            "right elbow should stay on its own side: elbow {:?}, shoulder {:?}",
+            pose.elbow,
+            pose.shoulder
+        );
+    }
+
+    #[test]
+    fn zero_reach_keeps_the_daydream_pose_untouched() {
+        let base = solve_arm(HandSide::Right, Quat::IDENTITY);
+        let pose = solve_arm_with_reach(HandSide::Right, Quat::IDENTITY, Vec3::ZERO);
+        assert!((pose.wrist - base.wrist).length() < 1e-6);
+        assert!((pose.hand - base.hand).length() < 1e-6);
+    }
+
+    #[test]
+    fn upper_arm_is_hidden_at_rest_and_back_when_leaning() {
+        let neutral = solve_arm(HandSide::Right, Quat::IDENTITY);
+        assert!(
+            upper_fade(&neutral, Vec3::ZERO) < 0.01,
+            "at rest the neutral shoulder is next to the eye: the sleeve must hide"
+        );
+
+        // Full torso lean (looking down 60°) moves the shoulders 35 cm down / 25 cm forward,
+        // clear of the camera, so the upper arm can come back.
+        assert!(
+            upper_fade(&neutral, LEAN_OFFSET) > 0.99,
+            "leaning should bring the upper arm back (fade {})",
+            upper_fade(&neutral, LEAN_OFFSET)
+        );
     }
 }

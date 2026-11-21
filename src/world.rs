@@ -31,6 +31,16 @@ const BENCH_Z: f32 = (BENCH_FRONT_Z + BENCH_BACK_Z) * 0.5;
 /// Bench depth (positive; front edge is the larger Z).
 const BENCH_DEPTH: f32 = BENCH_FRONT_Z - BENCH_BACK_Z;
 
+// Prop masses: avian's default density is 1 kg/m³, which makes a 10 cm cube weigh 1 g.
+// Real-feeling values (DESIGN §7): light wood props 0.18–0.6 kg, crates ~3 kg, big floor
+// balls ~0.4 kg (hollow).
+/// Bench props (0.08–0.12 m): light wood, ≈0.18–0.63 kg.
+const BENCH_PROP_DENSITY: f32 = 350.0;
+/// Crates (0.34 m cube, 0.039 m³): 75 kg/m³ ≈ 2.95 kg.
+const CRATE_DENSITY: f32 = 75.0;
+/// Big floor balls (r = 0.26 m, 0.0736 m³): 5.5 kg/m³ ≈ 0.40 kg.
+const FLOOR_BALL_DENSITY: f32 = 5.5;
+
 pub struct WorldPlugin;
 
 impl Plugin for WorldPlugin {
@@ -253,6 +263,7 @@ fn setup_world(
                 Transform::from_translation(pos).with_rotation(Quat::from_rotation_y(yaw)),
                 RigidBody::Dynamic,
                 Collider::cuboid(0.34, 0.34, 0.34),
+                ColliderDensity(CRATE_DENSITY),
                 Friction::new(0.85),
                 Restitution::new(0.05),
                 Grabbable,
@@ -275,6 +286,7 @@ fn setup_world(
                 Transform::from_translation(pos),
                 RigidBody::Dynamic,
                 Collider::sphere(0.26),
+                ColliderDensity(FLOOR_BALL_DENSITY),
                 Friction::new(0.6),
                 Restitution::new(0.25),
                 Grabbable,
@@ -439,6 +451,7 @@ fn spawn_bench_props(
                     .with_rotation(Quat::from_rotation_y(yaw)),
                 RigidBody::Dynamic,
                 collider,
+                ColliderDensity(BENCH_PROP_DENSITY),
                 Friction::new(0.65),
                 Restitution::new(0.18),
                 Grabbable,
