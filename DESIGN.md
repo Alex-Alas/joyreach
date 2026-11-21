@@ -57,6 +57,9 @@ Escala humana real (metros). Props de 8–15 cm: del tamaño de algo que agarras
 
 - Ojos a 1.60 m, **FOV 80°**, sin head-bob (pelea con la precisión del brazo).
 - Los brazos ocupan el **25–35 % inferior** del cuadro en reposo; la mesa entra entera al mirar ~20° abajo.
+- **Agacharse automático:** al mirar abajo, los ojos bajan de 1.60 a ~0.90 m entre −35° y −80° de pitch (smoothstep, ~150 ms, sin head-bob). Las manos bajan con ellos, así que la franja de los brazos en el cuadro no cambia: cambia su altura en el mundo. El torso que se inclina en §7 se suma encima.
+- **Agacharse fijo:** clic del stick izquierdo (o C/Ctrl) deja los ojos a 0.95 m, el paso a ~1.4 m/s y la cápsula a 1.10 m; si hay algo arriba no se puede parar. Sin head-bob al entrar ni al salir.
+- **Salto:** B (Joy-Con R) o Space, ~0.6 m de alto, solo desde el piso (0.1 s de coyote). La cámara no gana ni shake ni sonido: solo acompaña al cuerpo.
 - Giro con stick: curva cuadrática; nunca aceleración de mouse.
 
 ## 7. Brazos y manos
@@ -65,9 +68,11 @@ Escala humana real (metros). Props de 8–15 cm: del tamaño de algo que agarras
 - Manos: guante `glove` mate, palma + 4 dedos + pulgar. Formas redondeadas, como el propio Joy-Con: nada de aristas vivas.
   Malla del `generic-hand` de WebXR (W3C, crédito en README), material reemplazado por `glove`; las juntas de los dedos se articulan por gatillo y el pulgar queda hacia adentro.
 - **Gatillo = puño:** los dedos se cierran en ~80 ms con ease-out; al soltar, se abren en ~120 ms. Es la confirmación visual del agarre.
+- **Profundidad (M2a, por IMU):** la mano sigue el empuje/jale/golpe real. En el hilo de SDL, a tasa IMU: `a = yaw·q·accel − ĝ·Y`, con `ĝ` medida por mano en las ventanas de quietud (el Joy-Con L mide ~10.1 m/s² y el R ~8.9; restar 9.81 fijo haría derivar). Banda muerta 0.15 m/s², fuga de velocidad τ = 0.5 s, ZUPT (v = 0) tras 60 ms quieto para que la mano **quede** donde la dejaste, tope de 0.35 m y retorno lento a la pose del modelo (τ = 3.5 s). Se publica como `HandInput::reach` y se resetea al recentrar. El codo se resuelve con IK analítica de dos huesos (ley de cosenos, polo abajo/afuera) hacia la muñeca desplazada, dentro del alcance real del brazo.
 - **Alcance:** mirar por debajo de −20° inclina el torso (hombros y manos bajan 35 cm y avanzan 25 cm, suavizado ~100 ms) para llegar a lo que muestra la cámara. A 0° el desplazamiento es cero.
 - Desconectado: el brazo queda en reposo y la manga baja a 50 % de saturación. Sin mensajes de error en el mundo.
-- Cerca de la cámara: fade de la mano (no atravesar la cara).
+- Cerca de la cámara: se oculta el **brazo superior** mientras su hombro esté a menos de ~0.3 m del ojo (a 20 cm una manga de 10 cm ocupa un cuadro entero abajo a los lados); reaparece a ~0.5 m al inclinarse. La mano se desvanece si se acerca a la cara (escala), no atraviesa la cámara.
+- **Agarre y peso:** al cerrar la mano el prop se acomoda en la palma en ~80 ms (centro a media medida bajo la palma, sobre la normal), en vez de quedar a 12–14 cm. Masas reales: props 0.2–0.6 kg, cajas ~3 kg, pelotas grandes ~0.4 kg. Límite de fuerza 60 N: las cajas se retrasan visiblemente y lo liviano va pegado. Lanzar = velocidad de la mano × 1.1 (máx. 12 m/s).
 
 ## 8. Contorno de agarre
 
