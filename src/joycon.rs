@@ -21,7 +21,9 @@
 //! Everything in [`Diagnostics`] is extra, non-contract information for the `joycon_probe`
 //! example and debug HUDs; gameplay code should not depend on it.
 
+use std::collections::VecDeque;
 use std::ffi::CStr;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread::JoinHandle;
@@ -55,11 +57,11 @@ pub struct HandInput {
     /// Hand translation from IMU dead reckoning, in the recentered body frame (metres,
     /// **-Z forward**, +Y up, +X right). Zero when the hand is at the model's rest pose.
     ///
-    /// This is how a real push/pull/punch moves the hand: the linear acceleration from the
-    /// accelerometer (minus the per-hand gravity estimate) is integrated with a velocity leak
-    /// and a zero-velocity update while still, so the offset stays where the user stopped it.
-    /// Bounded to ~0.35 m and leaked back toward the rest pose (τ ≈ 3.5 s).
-    /// Reset by recenter and on reconnect.
+    /// **M2c: always zero unless `JOYREACH_REACH=1`.** Depth is opt-in while the palm beam owns
+    /// distance; with it off the arms render the pure orientation pose. When enabled, a real
+    /// push/pull/punch moves the hand: linear acceleration (minus gravity) is integrated with a
+    /// velocity leak and a zero-velocity update while still, bounded to ~0.35 m, and leaked back
+    /// toward the rest pose (τ ≈ 3.5 s). Reset by recenter and on reconnect.
     pub reach: Vec3,
     /// Velocity of [`HandInput::reach`] (body-space m/s), for debug / throw feel.
     pub reach_velocity: Vec3,
@@ -163,6 +165,237 @@ pub fn orientation_yaw_pitch_roll_deg(q: Quat) -> Vec3 {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Accelerometer calibration (per axis, per hand)
+// ---------------------------------------------------------------------------------------------
+
+/// Per-axis accelerometer correction, in the SDL device frame (which is also our body frame,
+/// see [`device_to_body`]):
+///
+/// `a_cal = scale * (a_raw - offset)`
+///
+/// Six parameters (three scales, three offsets) fitted so that `|a_cal| = GRAVITY` for still
+/// samples in at least six orientations. Real Joy-Cons have per-axis scale errors of a few
+/// percent and offsets of ~0.1-0.5 m/s². Subtracting only a scalar `ĝ·Y` cannot remove them:
+/// when the user only ROTATES the wrist, the uncalibrated magnitude swings by up to ~1 m/s²,
+/// the residual is integrated as linear motion and the hand "drifts" up to the reach clamp.
+///
+/// The fit is a Gauss-Newton/Levenberg least-squares over `r = |S·(a - b)| - GRAVITY`, with
+/// the scales clamped positive (the constraint is invariant to a sign flip per axis; starting
+/// at scale 1 selects the physical solution). No new crates: the 6x6 normal equations are
+/// solved with a tiny Gaussian elimination.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AccelCalib {
+    pub scale: Vec3,
+    pub offset: Vec3,
+}
+
+impl Default for AccelCalib {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
+impl AccelCalib {
+    pub const IDENTITY: Self = Self {
+        scale: Vec3::ONE,
+        offset: Vec3::ZERO,
+    };
+
+    #[inline]
+    pub fn apply(&self, raw_dev: Vec3) -> Vec3 {
+        self.scale * (raw_dev - self.offset)
+    }
+
+    /// Reject nonsense fits (a swapped axis or a glitched pose must not be saved).
+    pub fn is_usable(&self) -> bool {
+        let s = self.scale;
+        let b = self.offset;
+        s.is_finite()
+            && b.is_finite()
+            && s.min_element() > 0.5
+            && s.max_element() < 2.0
+            && b.abs().max_element() < 2.0
+    }
+
+    /// Fit `scale`/`offset` from mean still-sample vectors taken in >= 6 distinct orientations.
+    ///
+    /// Returns `(calibration, rms_before, rms_after)` where the RMS is in m/s² of the
+    /// `|a| - GRAVITY` residual (before = as if uncalibrated, i.e. scale 1 / offset 0).
+    pub fn fit(still: &[Vec3]) -> Option<(Self, f32, f32)> {
+        if still.len() < 6 {
+            return None;
+        }
+        let g = GRAVITY as f64;
+        // [sx, sy, sz, bx, by, bz]
+        let mut p = [1.0_f64, 1.0, 1.0, 0.0, 0.0, 0.0];
+
+        let cost = |p: &[f64; 6]| -> f64 {
+            still
+                .iter()
+                .map(|&a| {
+                    let c = calibration_at(*p).apply(a);
+                    let r = c.length() as f64 - g;
+                    r * r
+                })
+                .sum()
+        };
+
+        let mut lambda = 1e-3_f64;
+        let mut current = cost(&p);
+        for _ in 0..80 {
+            let mut normal = [[0.0_f64; 6]; 6];
+            let mut rhs = [0.0_f64; 6];
+            for &a in still {
+                let out = calibration_at(p);
+                let c = out.apply(a);
+                let len = c.length().max(1e-6);
+                let r = len as f64 - g;
+                let d = (a - out.offset).as_dvec3();
+                let c_hat = c / len;
+                let j = [
+                    c_hat.x as f64 * d.x,
+                    c_hat.y as f64 * d.y,
+                    c_hat.z as f64 * d.z,
+                    -(c_hat.x as f64) * out.scale.x as f64,
+                    -(c_hat.y as f64) * out.scale.y as f64,
+                    -(c_hat.z as f64) * out.scale.z as f64,
+                ];
+                for i in 0..6 {
+                    rhs[i] -= j[i] * r;
+                    for k in 0..6 {
+                        normal[i][k] += j[i] * j[k];
+                    }
+                }
+            }
+
+            let mut accepted = false;
+            for _ in 0..14 {
+                let mut matrix = normal;
+                for i in 0..6 {
+                    // Scale-aware Levenberg damping: large-parameter directions move less.
+                    matrix[i][i] += lambda * (1.0 + normal[i][i]);
+                }
+                let mut delta = rhs;
+                let Some(step) = solve6(matrix, &mut delta) else {
+                    lambda = (lambda * 10.0).min(1e6);
+                    continue;
+                };
+                let mut trial = p;
+                let mut step_max = 0.0_f64;
+                for i in 0..6 {
+                    trial[i] += step[i];
+                    step_max = step_max.max(step[i].abs());
+                }
+                for k in 0..3 {
+                    trial[k] = trial[k].clamp(0.5, 2.0);
+                }
+                for k in 3..6 {
+                    trial[k] = trial[k].clamp(-2.0, 2.0);
+                }
+                let trial_cost = cost(&trial);
+                if trial_cost < current {
+                    p = trial;
+                    current = trial_cost;
+                    lambda = (lambda * 0.3).max(1e-9);
+                    accepted = true;
+                    if step_max < 1e-10 {
+                        // Converged: the remaining iterations cannot change the fit.
+                        lambda = 1e9;
+                    }
+                    break;
+                }
+                lambda = (lambda * 10.0).min(1e6);
+            }
+            if !accepted || lambda >= 1e9 {
+                break;
+            }
+        }
+
+        let calib = calibration_at(p);
+        if !calib.is_usable() {
+            return None;
+        }
+        let before = Self::residual_rms(still, &Self::IDENTITY);
+        let after = Self::residual_rms(still, &calib);
+        // Six well-spread orientations must fit better than this; anything else is a bad run.
+        if !after.is_finite() || after > 0.5 {
+            return None;
+        }
+        Some((calib, before, after))
+    }
+
+    /// RMS of `|a_cal| - GRAVITY` over the given still samples (m/s²).
+    pub fn residual_rms(still: &[Vec3], calib: &Self) -> f32 {
+        if still.is_empty() {
+            return 0.0;
+        }
+        let sum: f32 = still
+            .iter()
+            .map(|&a| {
+                let r = calib.apply(a).length() - GRAVITY;
+                r * r
+            })
+            .sum();
+        (sum / still.len() as f32).sqrt()
+    }
+
+    /// Text lines in the calibration file format (see [`ImuCalibration`]).
+    fn text_lines(&self, hand: &str) -> String {
+        let (s, o) = (self.scale, self.offset);
+        format!(
+            "{hand} scale {:.6} {:.6} {:.6}\n{hand} offset {:.6} {:.6} {:.6}\n",
+            s.x, s.y, s.z, o.x, o.y, o.z
+        )
+    }
+}
+
+fn calibration_at(p: [f64; 6]) -> AccelCalib {
+    AccelCalib {
+        scale: Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32),
+        offset: Vec3::new(p[3] as f32, p[4] as f32, p[5] as f32),
+    }
+}
+
+/// Gaussian elimination with partial pivoting for a 6x6 system. Returns `None` if singular.
+fn solve6(mut a: [[f64; 6]; 6], b: &mut [f64; 6]) -> Option<[f64; 6]> {
+    for col in 0..6 {
+        let mut pivot = col;
+        for row in col + 1..6 {
+            if a[row][col].abs() > a[pivot][col].abs() {
+                pivot = row;
+            }
+        }
+        if a[pivot][col].abs() < 1e-12 {
+            return None;
+        }
+        if pivot != col {
+            a.swap(pivot, col);
+            b.swap(pivot, col);
+        }
+        let inv = 1.0 / a[col][col];
+        for row in col + 1..6 {
+            let factor = a[row][col] * inv;
+            if factor == 0.0 {
+                continue;
+            }
+            for k in col..6 {
+                a[row][k] -= factor * a[col][k];
+            }
+            b[row] -= factor * b[col];
+        }
+    }
+    let mut x = [0.0_f64; 6];
+    for row in (0..6).rev() {
+        let mut acc = b[row];
+        for k in row + 1..6 {
+            acc -= a[row][k] * x[k];
+        }
+        x[row] = acc / a[row][row];
+    }
+    Some(x)
+}
+
+// ---------------------------------------------------------------------------------------------
 // Diagnostics (non-contract; used by examples/joycon_probe.rs and optional debug HUDs)
 // ---------------------------------------------------------------------------------------------
 
@@ -214,11 +447,17 @@ pub struct HandDebug {
     pub body_accel: Vec3,
     pub gyro_bias: Vec3,
     pub bias_ready: bool,
+    /// True when the per-axis accelerometer calibration file is in use for this hand.
+    pub accel_calibrated: bool,
+    pub accel_calib_scale: Vec3,
+    pub accel_calib_offset: Vec3,
     /// This hand's measured gravity magnitude (m/s²), used by the reach dead reckoning.
     pub reach_gravity: f32,
     /// Reach offset / velocity (body space, metres and m/s).
     pub reach: Vec3,
     pub reach_velocity: Vec3,
+    /// Whether IMU depth is enabled at all (`JOYREACH_REACH=1`).
+    pub reach_enabled: bool,
     pub imu_hz: f32,
     /// SDL errors / unavailable sensors collected while opening this pad.
     pub notes: Vec<String>,
@@ -258,6 +497,18 @@ fn forward_rumble(worker: Res<JoyConWorker>, mut messages: MessageReader<Rumble>
     }
 }
 
+/// One raw IMU sample, emitted at the rate the Switch driver produces them (for
+/// `joycon_probe --record` and the CSV replay tests). Values are the raw SDL device-frame
+/// readings, before calibration or bias correction.
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)] // used by examples/joycon_probe.rs
+pub struct ImuSample {
+    pub ts_ns: u64,
+    pub hand: Hand,
+    pub gyro: Vec3,
+    pub accel: Vec3,
+}
+
 /// Handle to the SDL thread. Dropping it asks the thread to stop and joins it (this happens when
 /// Bevy drops its resources on exit). Also usable without Bevy, which is what the probe does.
 #[derive(Resource)]
@@ -272,10 +523,19 @@ pub struct JoyConWorker {
 
 impl JoyConWorker {
     pub fn spawn() -> Self {
+        Self::spawn_with_recorder(None)
+    }
+
+    /// Spawn the SDL thread, optionally streaming every raw IMU sample to `recorder`.
+    /// The game uses [`JoyConWorker::spawn`]; `joycon_probe --record/--calibrate` uses this.
+    #[allow(dead_code)] // used by examples/joycon_probe.rs
+    pub fn spawn_with_recorder(recorder: Option<mpsc::Sender<ImuSample>>) -> Self {
         let hands = Arc::new(Mutex::new(Hands::default()));
         let debug = Arc::new(Mutex::new(Diagnostics::default()));
         let stop = Arc::new(AtomicBool::new(false));
         let (rumble_tx, rumble_rx) = mpsc::channel::<RumbleCommand>();
+        // One load per process (the probe and the game both come through here), reported once.
+        let calibration = Arc::new(load_imu_calibration());
 
         let thread = {
             let hands = Arc::clone(&hands);
@@ -283,7 +543,9 @@ impl JoyConWorker {
             let stop = Arc::clone(&stop);
             std::thread::Builder::new()
                 .name("joycon-sdl".to_string())
-                .spawn(move || sdl_thread_main(hands, debug, stop, rumble_rx))
+                .spawn(move || {
+                    sdl_thread_main(hands, debug, stop, rumble_rx, recorder, calibration)
+                })
                 .map_err(|e| eprintln!("[joycon] could not spawn SDL thread: {e}"))
                 .ok()
         };
@@ -370,6 +632,8 @@ fn sdl_thread_main(
     debug: Arc<Mutex<Diagnostics>>,
     stop: Arc<AtomicBool>,
     rumble_rx: mpsc::Receiver<RumbleCommand>,
+    recorder: Option<mpsc::Sender<ImuSample>>,
+    calibration: Arc<ImuCalibration>,
 ) {
     // Hints must be set before SDL_Init so the HIDAPI device enumeration already sees them.
     unsafe {
@@ -408,7 +672,7 @@ fn sdl_thread_main(
         if !ids.is_null() {
             for i in 0..count.max(0) as isize {
                 let id = *ids.offset(i);
-                if let Some(pad) = open_joycon(id) {
+                if let Some(pad) = open_joycon(id, &calibration, recorder.clone()) {
                     pads.push(pad);
                 }
             }
@@ -429,7 +693,7 @@ fn sdl_thread_main(
         let got_event = unsafe { SDL_WaitEventTimeout(&mut event, POLL_TIMEOUT_MS) };
         if got_event {
             loop {
-                handle_event(&event, &mut pads);
+                handle_event(&event, &mut pads, &calibration, &recorder);
                 let more = unsafe { SDL_PollEvent(&mut event) };
                 if !more {
                     break;
@@ -446,7 +710,11 @@ fn sdl_thread_main(
         // Minus OR Plus recenters both hands (yaw only): you point both Joy-Cons at the screen
         // and press whichever button your thumb finds.
         if recenter {
-            for rt in pads.iter_mut().flat_map(|p| [p.left.as_mut(), p.right.as_mut()]).flatten() {
+            for rt in pads
+                .iter_mut()
+                .flat_map(|p| [p.left.as_mut(), p.right.as_mut()])
+                .flatten()
+            {
                 rt.fusion.recenter();
                 rt.reach.reset();
                 rt.input.orientation = rt.fusion.orientation();
@@ -502,7 +770,9 @@ fn sdl_error() -> String {
     if ptr.is_null() {
         "unknown SDL error".to_string()
     } else {
-        unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
+        unsafe { CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
@@ -510,7 +780,9 @@ fn cstr(ptr: *const std::ffi::c_char) -> String {
     if ptr.is_null() {
         String::new()
     } else {
-        unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
+        unsafe { CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
@@ -519,9 +791,348 @@ fn cstr(ptr: *const std::ffi::c_char) -> String {
 // ---------------------------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Hand {
+pub enum Hand {
     Left,
     Right,
+}
+
+impl Hand {
+    fn index(self) -> usize {
+        match self {
+            Hand::Left => 0,
+            Hand::Right => 1,
+        }
+    }
+
+    /// Lower-case name used by the calibration file.
+    pub fn name(self) -> &'static str {
+        match self {
+            Hand::Left => "left",
+            Hand::Right => "right",
+        }
+    }
+
+    /// One-letter tag used by `joycon_probe --record` CSVs.
+    #[allow(dead_code)] // used by examples/joycon_probe.rs and the CSV replay test
+    pub fn short(self) -> &'static str {
+        match self {
+            Hand::Left => "L",
+            Hand::Right => "R",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Calibration file + guided calibration collector
+// ---------------------------------------------------------------------------------------------
+
+/// Both hands' accelerometer calibrations, as loaded from `%LOCALAPPDATA%\joyreach\imu_calib.txt`.
+///
+/// The file is a hand-parsed text format (no serde):
+///
+/// ```text
+/// # joyreach imu accel calibration v1
+/// # a_cal = scale * (a_raw - offset)   [m/s^2, SDL device frame]
+/// left scale 1.031200 -0.012300 0.998700
+/// left offset 0.081200 -0.042000 0.113000
+/// right scale ...
+/// right offset ...
+/// ```
+///
+/// A missing file is not an error: both hands then keep the pre-M2c scalar-`ĝ` fallback.
+#[derive(Clone, Debug, Default)]
+pub struct ImuCalibration {
+    pub hands: [Option<AccelCalib>; 2],
+}
+
+impl ImuCalibration {
+    pub fn get(&self, hand: Hand) -> Option<AccelCalib> {
+        self.hands[hand.index()]
+    }
+
+    pub fn any(&self) -> bool {
+        self.hands.iter().any(Option::is_some)
+    }
+
+    pub fn to_text(&self) -> String {
+        let mut out = String::from(
+            "# joyreach imu accel calibration v1\n\
+             # a_cal = scale * (a_raw - offset)   [m/s^2, SDL device frame]\n",
+        );
+        for hand in [Hand::Left, Hand::Right] {
+            if let Some(calib) = self.get(hand) {
+                out.push_str(&calib.text_lines(hand.name()));
+            }
+        }
+        out
+    }
+
+    /// Parse the text format. Unknown keys / malformed numbers are hard errors so a corrupted
+    /// file is reported instead of silently mis-calibrating both hands.
+    pub fn parse_text(text: &str) -> Result<Self, String> {
+        let mut scales = [None; 2];
+        let mut offsets = [None; 2];
+        for (line_no, raw_line) in text.lines().enumerate() {
+            let line = raw_line.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() != 5 {
+                return Err(format!(
+                    "line {}: expected `hand scale|offset x y z`, got `{line}`",
+                    line_no + 1
+                ));
+            }
+            let hand = match fields[0].to_ascii_lowercase().as_str() {
+                "left" | "l" => Hand::Left,
+                "right" | "r" => Hand::Right,
+                other => return Err(format!("line {}: unknown hand `{other}`", line_no + 1)),
+            };
+            let mut v = [0.0_f32; 3];
+            for (i, field) in fields[2..].iter().enumerate() {
+                v[i] = field
+                    .parse::<f32>()
+                    .map_err(|_| format!("line {}: invalid number `{field}`", line_no + 1))?;
+            }
+            let value = Vec3::new(v[0], v[1], v[2]);
+            match fields[1] {
+                "scale" => scales[hand.index()] = Some(value),
+                "offset" => offsets[hand.index()] = Some(value),
+                other => return Err(format!("line {}: unknown key `{other}`", line_no + 1)),
+            }
+        }
+
+        let mut out = Self::default();
+        for hand in [Hand::Left, Hand::Right] {
+            match (scales[hand.index()], offsets[hand.index()]) {
+                (Some(scale), Some(offset)) => {
+                    let calib = AccelCalib { scale, offset };
+                    if !calib.is_usable() {
+                        return Err(format!("{}: scale/offset out of range", hand.name()));
+                    }
+                    out.hands[hand.index()] = Some(calib);
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(format!(
+                        "{}: the scale and offset lines must both be present",
+                        hand.name()
+                    ));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        Self::parse_text(&text)
+    }
+
+    /// Write the file used by the game at startup (probe `--calibrate`).
+    #[allow(dead_code)] // used by examples/joycon_probe.rs
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(path, self.to_text()).map_err(|e| e.to_string())
+    }
+}
+
+/// `%LOCALAPPDATA%\joyreach\imu_calib.txt` (same folder convention as the rest of the game).
+pub fn imu_calib_path() -> Option<PathBuf> {
+    if let Some(base) = std::env::var_os("LOCALAPPDATA") {
+        return Some(PathBuf::from(base).join("joyreach").join("imu_calib.txt"));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return Some(
+            PathBuf::from(home)
+                .join(".local")
+                .join("share")
+                .join("joyreach")
+                .join("imu_calib.txt"),
+        );
+    }
+    None
+}
+
+/// Load the calibration at startup and say clearly (stderr) whether it is in use.
+pub fn load_imu_calibration() -> ImuCalibration {
+    let Some(path) = imu_calib_path() else {
+        eprintln!(
+            "[joycon] accel calibration not found (no LOCALAPPDATA/HOME); using scalar gravity fallback"
+        );
+        return ImuCalibration::default();
+    };
+    if !path.exists() {
+        eprintln!(
+            "[joycon] accel calibration not found ({}); using scalar gravity fallback",
+            path.display()
+        );
+        return ImuCalibration::default();
+    }
+    match ImuCalibration::load(&path) {
+        Ok(calib) if calib.any() => {
+            eprintln!(
+                "[joycon] accel calibration loaded from {} ({})",
+                path.display(),
+                calibration_summary(&calib)
+            );
+            calib
+        }
+        Ok(_) => {
+            eprintln!(
+                "[joycon] accel calibration not found ({}); using scalar gravity fallback",
+                path.display()
+            );
+            ImuCalibration::default()
+        }
+        Err(err) => {
+            eprintln!(
+                "[joycon] accel calibration invalid ({}): {err}; using scalar gravity fallback",
+                path.display()
+            );
+            ImuCalibration::default()
+        }
+    }
+}
+
+fn calibration_summary(calib: &ImuCalibration) -> String {
+    let mut parts = Vec::new();
+    for hand in [Hand::Left, Hand::Right] {
+        match calib.get(hand) {
+            Some(c) => parts.push(format!(
+                "{} scale=({:.4},{:.4},{:.4}) offset=({:+.4},{:+.4},{:+.4})",
+                hand.name(),
+                c.scale.x,
+                c.scale.y,
+                c.scale.z,
+                c.offset.x,
+                c.offset.y,
+                c.offset.z
+            )),
+            None => parts.push(format!("{} none", hand.name())),
+        }
+    }
+    parts.join(", ")
+}
+
+/// One still pose collected during `joycon_probe --calibrate`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CalibPose {
+    /// The window is not complete / not still yet.
+    Waiting,
+    /// A still, diverse pose; the mean raw accel (SDL device frame) was accepted.
+    Accepted(Vec3),
+    /// Still, but too close (< 25°) to a pose that was already collected.
+    Duplicate(Vec3),
+}
+
+/// Guided 6-face calibration helper used by `joycon_probe --calibrate`.
+///
+/// It reuses the same variance-based stillness idea as the IMU bias windows: a pose is accepted
+/// only after ~1 s of low gyro AND low accel variance, so a hand tremor or a bump is ignored.
+/// Poses must be at least 25° apart in gravity direction, otherwise the least-squares system is
+/// badly conditioned and the fit is meaningless.
+#[derive(Clone, Debug, Default)]
+pub struct CalibCollector {
+    window: VecDeque<(u64, Vec3, Vec3)>,
+    step_start: Option<u64>,
+    poses: Vec<Vec3>,
+}
+
+const CALIB_STILL_NS: u64 = 1_000_000_000;
+const CALIB_MIN_SAMPLES: usize = 100;
+const CALIB_ACCEL_STD: f32 = 0.15;
+const CALIB_GYRO_MEAN: f32 = 0.15;
+const CALIB_MIN_POSE_DEG: f32 = 25.0;
+
+#[allow(dead_code)] // used by examples/joycon_probe.rs
+impl CalibCollector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Start a new guided step: the previous window and its timestamps are discarded so the
+    /// previous face cannot be accepted again by accident.
+    pub fn begin_step(&mut self) {
+        self.window.clear();
+        self.step_start = None;
+    }
+
+    pub fn push(&mut self, ts_ns: u64, accel: Vec3, gyro: Vec3) {
+        let _ = self.step_start.get_or_insert(ts_ns);
+        self.window.push_back((ts_ns, accel, gyro));
+        while let Some(&(oldest, _, _)) = self.window.front() {
+            if ts_ns.saturating_sub(oldest) > CALIB_STILL_NS {
+                self.window.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub fn poses(&self) -> &[Vec3] {
+        &self.poses
+    }
+
+    pub fn take_pose(&mut self) -> CalibPose {
+        let Some(start) = self.step_start else {
+            return CalibPose::Waiting;
+        };
+        let Some(&(newest, _, _)) = self.window.back() else {
+            return CalibPose::Waiting;
+        };
+        let Some(&(oldest, _, _)) = self.window.front() else {
+            return CalibPose::Waiting;
+        };
+        // Fresh samples after `begin_step` AND a full window of them.
+        if newest.saturating_sub(start) < CALIB_STILL_NS
+            || newest.saturating_sub(oldest) < CALIB_STILL_NS * 3 / 4
+            || self.window.len() < CALIB_MIN_SAMPLES
+        {
+            return CalibPose::Waiting;
+        }
+
+        let n = self.window.len() as f32;
+        let mut sum_a = Vec3::ZERO;
+        let mut sum_a2 = Vec3::ZERO;
+        let mut sum_g = 0.0_f32;
+        for &(_, accel, gyro) in &self.window {
+            sum_a += accel;
+            sum_a2 += accel * accel;
+            sum_g += gyro.length();
+        }
+        let mean_a = sum_a / n;
+        let variance = (sum_a2 / n - mean_a * mean_a).max(Vec3::ZERO).element_sum();
+        if variance.sqrt() > CALIB_ACCEL_STD || sum_g / n > CALIB_GYRO_MEAN {
+            return CalibPose::Waiting;
+        }
+
+        let direction = mean_a.normalize_or_zero();
+        let min_dot = CALIB_MIN_POSE_DEG.to_radians().cos();
+        if self
+            .poses
+            .iter()
+            .any(|pose| direction.dot(pose.normalize_or_zero()) > min_dot)
+        {
+            return CalibPose::Duplicate(mean_a);
+        }
+        self.poses.push(mean_a);
+        CalibPose::Accepted(mean_a)
+    }
+
+    pub fn fit(&self) -> Option<(AccelCalib, f32, f32)> {
+        AccelCalib::fit(&self.poses)
+    }
+}
+
+/// Opt-in IMU hand depth (`JOYREACH_REACH=1`). Off by default since M2c: the palm beam owns
+/// distance, and orientation-only arms are the stable baseline.
+pub fn reach_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("JOYREACH_REACH").is_ok_and(|value| value == "1"))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -559,6 +1170,10 @@ struct Pad {
     notes: Vec<String>,
     left: Option<HandRuntime>,
     right: Option<HandRuntime>,
+    /// Optional raw-sample sink (probe `--record` / `--calibrate`).
+    recorder: Option<mpsc::Sender<ImuSample>>,
+    /// Loaded per-hand accel calibration, also used for hands created defensively later.
+    calibration: [Option<AccelCalib>; 2],
     /// Last low/high amplitudes sent, to only call SDL when they change.
     last_rumble: (u16, u16),
     /// Print at most one "rumble failed" line per pad.
@@ -645,7 +1260,6 @@ fn send_pad_rumble(pad: &mut Pad, state: &RumbleState, now: Instant) -> bool {
     ok
 }
 
-
 /// Per-hand state that lives next to its pad (so unplugging the pad unplugs its hands).
 struct HandRuntime {
     input: HandInput,
@@ -661,14 +1275,14 @@ struct HandRuntime {
 }
 
 impl HandRuntime {
-    fn new() -> Self {
+    fn new(calib: Option<AccelCalib>) -> Self {
         Self {
             input: HandInput {
                 connected: true,
                 ..Default::default()
             },
-            fusion: ImuFusion::new(),
-            reach: ReachTracker::new(),
+            fusion: ImuFusion::with_calibration(calib),
+            reach: ReachTracker::with_calibration(calib),
             last_gyro: Vec3::ZERO,
             last_accel: Vec3::ZERO,
             pending_gyro: None,
@@ -701,7 +1315,11 @@ fn sensor_label(ty: SDL_SensorType) -> &'static str {
 }
 
 /// Open and classify one SDL gamepad. Returns `None` for non-Joy-Con devices.
-fn open_joycon(id: SDL_JoystickID) -> Option<Pad> {
+fn open_joycon(
+    id: SDL_JoystickID,
+    calibration: &ImuCalibration,
+    recorder: Option<mpsc::Sender<ImuSample>>,
+) -> Option<Pad> {
     unsafe {
         SDL_ClearError();
         let ptr = SDL_OpenGamepad(id);
@@ -723,6 +1341,8 @@ fn open_joycon(id: SDL_JoystickID) -> Option<Pad> {
 
         let gamepad_name = cstr(SDL_GetGamepadName(ptr));
         let gamepad_type = cstr(SDL_GetGamepadStringForType(ty));
+        let left_calib = calibration.get(Hand::Left);
+        let right_calib = calibration.get(Hand::Right);
 
         let mut pad = Pad {
             id,
@@ -732,8 +1352,10 @@ fn open_joycon(id: SDL_JoystickID) -> Option<Pad> {
             gamepad_type,
             sensors: Vec::new(),
             notes: Vec::new(),
-            left: (kind != PadKind::Right).then(HandRuntime::new),
-            right: (kind != PadKind::Left).then(HandRuntime::new),
+            left: (kind != PadKind::Right).then(|| HandRuntime::new(left_calib)),
+            right: (kind != PadKind::Left).then(|| HandRuntime::new(right_calib)),
+            recorder,
+            calibration: [left_calib, right_calib],
             last_rumble: (0, 0),
             rumble_warned: false,
         };
@@ -779,7 +1401,8 @@ unsafe fn enable_pad_sensors(pad: &mut Pad) {
         } else {
             let err = sdl_error();
             if !err.is_empty() {
-                pad.notes.push(format!("{} unavailable: {err}", sensor_label(ty)));
+                pad.notes
+                    .push(format!("{} unavailable: {err}", sensor_label(ty)));
             }
         }
     };
@@ -824,10 +1447,14 @@ fn sensors_for(kind: PadKind) -> &'static [(SDL_SensorType, Hand)] {
         (SDL_SENSOR_GYRO_R, Hand::Right),
         (SDL_SENSOR_ACCEL_R, Hand::Right),
     ];
-    const LEFT: &[(SDL_SensorType, Hand)] =
-        &[(SDL_SENSOR_GYRO, Hand::Left), (SDL_SENSOR_ACCEL, Hand::Left)];
-    const RIGHT: &[(SDL_SensorType, Hand)] =
-        &[(SDL_SENSOR_GYRO, Hand::Right), (SDL_SENSOR_ACCEL, Hand::Right)];
+    const LEFT: &[(SDL_SensorType, Hand)] = &[
+        (SDL_SENSOR_GYRO, Hand::Left),
+        (SDL_SENSOR_ACCEL, Hand::Left),
+    ];
+    const RIGHT: &[(SDL_SensorType, Hand)] = &[
+        (SDL_SENSOR_GYRO, Hand::Right),
+        (SDL_SENSOR_ACCEL, Hand::Right),
+    ];
 
     match kind {
         PadKind::Combined => COMBINED,
@@ -836,20 +1463,24 @@ fn sensors_for(kind: PadKind) -> &'static [(SDL_SensorType, Hand)] {
     }
 }
 
-fn handle_event(event: &SDL_Event, pads: &mut Vec<Pad>) {
+fn handle_event(
+    event: &SDL_Event,
+    pads: &mut Vec<Pad>,
+    calibration: &ImuCalibration,
+    recorder: &Option<mpsc::Sender<ImuSample>>,
+) {
     match unsafe { event.r#type } {
         t if t == SDL_EVENT_GAMEPAD_ADDED.0 => {
             let id = unsafe { event.gdevice.which };
             if pads.iter().any(|p| p.id == id) {
                 return;
             }
-            if let Some(pad) = open_joycon(id) {
+            if let Some(pad) = open_joycon(id, calibration, recorder.clone()) {
                 // A combined pair supersedes any single-pad view of the same hands; drop the
                 // singles so we don't straddle two topologies while SDL tears them down.
                 if pad.kind == PadKind::Combined {
-                    let (singles, old_combined): (Vec<Pad>, Vec<Pad>) = pads
-                        .drain(..)
-                        .partition(|p| p.kind != PadKind::Combined);
+                    let (singles, old_combined): (Vec<Pad>, Vec<Pad>) =
+                        pads.drain(..).partition(|p| p.kind != PadKind::Combined);
                     for old in old_combined {
                         eprintln!("[joycon] {} superseded by combined pair", old.gamepad_name);
                         unsafe { SDL_CloseGamepad(old.ptr) };
@@ -893,9 +1524,10 @@ fn handle_sensor(event: &SDL_Event, pads: &mut [Pad]) {
     };
     let value = Vec3::new(ev.data[0], ev.data[1], ev.data[2]);
 
+    let calib = pad.calibration[binding.hand.index()];
     let rt = match binding.hand {
-        Hand::Left => pad.left.get_or_insert_with(HandRuntime::new),
-        Hand::Right => pad.right.get_or_insert_with(HandRuntime::new),
+        Hand::Left => pad.left.get_or_insert_with(|| HandRuntime::new(calib)),
+        Hand::Right => pad.right.get_or_insert_with(|| HandRuntime::new(calib)),
     };
 
     if binding.gyro {
@@ -914,13 +1546,25 @@ fn handle_sensor(event: &SDL_Event, pads: &mut [Pad]) {
             _ => rt.last_gyro,
         };
         rt.fusion.push(gyro, value, ts);
-        // Reach runs at IMU rate next to the fusion, using the freshly updated orientation.
-        rt.reach.push(
-            device_to_body(value),
-            device_to_body(gyro) - rt.fusion.bias,
-            rt.fusion.orientation(),
-            ts,
-        );
+        if reach_enabled() {
+            // Opt-in M2 depth runs at IMU rate next to the fusion, using the freshly updated
+            // orientation. Off by default (`JOYREACH_REACH=1` enables it).
+            rt.reach.push(
+                device_to_body(value),
+                device_to_body(gyro) - rt.fusion.bias,
+                rt.fusion.orientation(),
+                ts,
+            );
+        }
+        if let Some(sink) = &pad.recorder {
+            // Record the exact pair the filters consumed (raw, before calibration/bias).
+            let _ = sink.send(ImuSample {
+                ts_ns: ts,
+                hand: binding.hand,
+                gyro,
+                accel: value,
+            });
+        }
     }
 }
 
@@ -993,8 +1637,19 @@ unsafe fn poll_pad(pad: &mut Pad) -> bool {
         rt.input.orientation = rt.fusion.orientation();
         rt.input.gyro = device_to_body(rt.last_gyro) - rt.fusion.bias;
         rt.input.accel = device_to_body(rt.last_accel);
-        rt.input.reach = rt.reach.offset;
-        rt.input.reach_velocity = rt.reach.velocity;
+        // M2c: depth is opt-in. With reach off the published field stays exactly zero, so the
+        // arm renders the untouched orientation-only pose (solve_arm_with_reach(_, _, ZERO)).
+        let reach_on = reach_enabled();
+        rt.input.reach = if reach_on {
+            rt.reach.offset
+        } else {
+            Vec3::ZERO
+        };
+        rt.input.reach_velocity = if reach_on {
+            rt.reach.velocity
+        } else {
+            Vec3::ZERO
+        };
         rt.input.imu_hz = rt.fusion.hz;
     }
     recenter
@@ -1036,6 +1691,9 @@ impl Pad {
     }
 
     fn debug_for(&self, hand: Hand, rt: &HandRuntime) -> HandDebug {
+        let raw_accel = device_to_body(rt.last_accel);
+        let calib = rt.fusion.calib;
+        let reach_on = reach_enabled();
         let mut d = HandDebug {
             connected: true,
             topology: self.kind.topology(),
@@ -1044,12 +1702,27 @@ impl Pad {
             raw_gyro: rt.last_gyro,
             raw_accel: rt.last_accel,
             body_gyro: device_to_body(rt.last_gyro) - rt.fusion.bias,
-            body_accel: device_to_body(rt.last_accel),
+            body_accel: match calib {
+                Some(c) => c.apply(raw_accel),
+                None => raw_accel,
+            },
             gyro_bias: rt.fusion.bias,
             bias_ready: rt.fusion.bias_ready,
+            accel_calibrated: calib.is_some(),
+            accel_calib_scale: calib.map_or(Vec3::ONE, |c| c.scale),
+            accel_calib_offset: calib.map_or(Vec3::ZERO, |c| c.offset),
             reach_gravity: rt.reach.gravity,
-            reach: rt.reach.offset,
-            reach_velocity: rt.reach.velocity,
+            reach: if reach_on {
+                rt.reach.offset
+            } else {
+                Vec3::ZERO
+            },
+            reach_velocity: if reach_on {
+                rt.reach.velocity
+            } else {
+                Vec3::ZERO
+            },
+            reach_enabled: reach_on,
             imu_hz: rt.fusion.hz,
             notes: self.notes.clone(),
             sensors: Vec::new(),
@@ -1096,9 +1769,25 @@ fn stick_from_sdl(x: i16, y_down: i16) -> Vec2 {
 const GRAVITY: f32 = 9.80665;
 /// Mahony accelerometer gain (1/s). ~0.5 s time constant at 200 Hz.
 const ACCEL_KP: f32 = 2.0;
-/// Only trust the accelerometer for tilt when |a| is within this band of 1 g (linear acceleration
-/// during a swing would otherwise tilt the estimate).
+/// Hard fallback band used when there is no accelerometer calibration: trust the accel for tilt
+/// only when |a| is this close to 1 g (a swing would otherwise tilt the estimate).
 const ACCEL_TRUST_BAND: f32 = 1.5;
+/// With a calibration file, `|a_cal|` is exactly 1 g at rest, so the tilt correction is faded
+/// out as soon as the magnitude departs even a little: a 3 m/s² lateral shake changes |a| by
+/// ~0.45 m/s² and must not pull the pointer's tilt. (Root cause B of the old hand drift.)
+const ACCEL_CAL_BAND_SOFT: f32 = 0.10;
+const ACCEL_CAL_BAND_HARD: f32 = 0.35;
+/// Motion gate for the accel tilt correction: full trust below 0.10 rad/s, none above 0.60.
+/// During a wrist turn the accelerometer sees centripetal/tangential acceleration; integrating
+/// it as tilt made the pointer wobble and, in the old reach, leaked gravity into hand depth.
+const ACCEL_MOTION_LOW: f32 = 0.10;
+const ACCEL_MOTION_HIGH: f32 = 0.60;
+
+/// Hermite smoothstep (C1), used by all the soft gates: 0 below `edge0`, 1 above `edge1`.
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
 /// Gyro bias = mean of the raw gyro over "still" windows (GamepadMotionHelpers-style). Stillness
 /// is judged by how little the raw gyro/accel VARY inside a window, not by |gyro - bias|: the old
 /// magnitude gate deadlocked whenever the first estimate was off by more than its threshold (e.g.
@@ -1124,7 +1813,8 @@ const AUTO_RECENTER_SAMPLES: u32 = 40;
 /// quaternion (Bevy `Transform::rotation` convention: it maps body/local vectors to world).
 ///
 /// The accelerometer only corrects tilt (it cannot observe yaw); yaw comes from the gyro and is
-/// re-zeroed by [`ImuFusion::recenter`].
+/// re-zeroed by [`ImuFusion::recenter`]. When an [`AccelCalib`] is loaded, the accel is corrected
+/// per axis before both the tilt correction and the bias stillness windows.
 #[derive(Debug)]
 struct ImuFusion {
     /// body -> world.
@@ -1137,7 +1827,7 @@ struct ImuFusion {
     /// At least one still window has set `bias`.
     bias_calibrated: bool,
     bias_start_ts: Option<u64>,
-    /// Running sums of the current stillness window (raw body-space gyro/accel).
+    /// Running sums of the current stillness window (body-space gyro/accel, accel corrected).
     win_start: Option<u64>,
     win_n: u32,
     win_g: Vec3,
@@ -1150,10 +1840,19 @@ struct ImuFusion {
     hz_start_ts: Option<u64>,
     hz_count: u32,
     hz: f32,
+    /// Per-axis accelerometer correction, when the file was found.
+    calib: Option<AccelCalib>,
+    /// A/B switch for the motion gate (production is always `true`; tests measure both sides).
+    motion_gate: bool,
 }
 
 impl ImuFusion {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_calibration(None)
+    }
+
+    fn with_calibration(calib: Option<AccelCalib>) -> Self {
         Self {
             q: Quat::IDENTITY,
             yaw_offset: Quat::IDENTITY,
@@ -1173,6 +1872,8 @@ impl ImuFusion {
             hz_start_ts: None,
             hz_count: 0,
             hz: 0.0,
+            calib,
+            motion_gate: true,
         }
     }
 
@@ -1180,7 +1881,11 @@ impl ImuFusion {
     /// event's `sensor_timestamp`.
     fn push(&mut self, gyro_dev: Vec3, accel_dev: Vec3, ts_ns: u64) {
         let gyro = device_to_body(gyro_dev);
-        let accel = device_to_body(accel_dev);
+        let accel_raw = device_to_body(accel_dev);
+        let accel = match self.calib {
+            Some(calib) => calib.apply(accel_raw),
+            None => accel_raw,
+        };
 
         self.samples = self.samples.saturating_add(1);
         self.update_rate(ts_ns);
@@ -1208,18 +1913,45 @@ impl ImuFusion {
         };
 
         // During the initial bias window we deliberately don't integrate gyro.
-        let mut omega = if self.bias_ready {
+        let gyro_estimate = if self.bias_ready {
             gyro - self.bias
+        } else {
+            gyro
+        };
+        let mut omega = if self.bias_ready {
+            gyro_estimate
         } else {
             Vec3::ZERO
         };
 
         let a_norm = accel.length();
-        if (a_norm - GRAVITY).abs() < ACCEL_TRUST_BAND && a_norm > 0.1 {
-            // World up expressed in body space, per the current estimate.
+        if self.motion_gate {
+            // Fade the tilt correction out while turning: centripetal acceleration is not gravity.
+            let motion =
+                1.0 - smoothstep(ACCEL_MOTION_LOW, ACCEL_MOTION_HIGH, gyro_estimate.length());
+            let magnitude = if self.calib.is_some() {
+                1.0 - smoothstep(
+                    ACCEL_CAL_BAND_SOFT,
+                    ACCEL_CAL_BAND_HARD,
+                    (a_norm - GRAVITY).abs(),
+                )
+            } else if (a_norm - GRAVITY).abs() < ACCEL_TRUST_BAND {
+                1.0
+            } else {
+                0.0
+            };
+            let gain = ACCEL_KP * motion * magnitude;
+            if gain > 1e-4 && a_norm > 0.1 {
+                // World up expressed in body space, per the current estimate.
+                let up_est = self.q.conjugate() * Vec3::Y;
+                let a_hat = accel / a_norm;
+                // Mahony tilt error; positive gain drives `up_est` toward the measured up.
+                omega += a_hat.cross(up_est) * gain;
+            }
+        } else if (a_norm - GRAVITY).abs() < ACCEL_TRUST_BAND && a_norm > 0.1 {
+            // Pre-M2c behaviour, kept only as the A/B baseline in the tests.
             let up_est = self.q.conjugate() * Vec3::Y;
             let a_hat = accel / a_norm;
-            // Mahony tilt error; positive gain drives `up_est` toward the measured up.
             omega += a_hat.cross(up_est) * ACCEL_KP;
         }
 
@@ -1263,7 +1995,10 @@ impl ImuFusion {
         // Std dev of a 3-vector signal: sqrt of the summed per-axis variances.
         let std = |sum: Vec3, sum2: Vec3| {
             let mean = sum / n;
-            (sum2 / n - mean * mean).max(Vec3::ZERO).element_sum().sqrt()
+            (sum2 / n - mean * mean)
+                .max(Vec3::ZERO)
+                .element_sum()
+                .sqrt()
         };
         let mean_g = self.win_g / n;
         let still = self.win_n >= 20
@@ -1271,7 +2006,11 @@ impl ImuFusion {
             && std(self.win_a, self.win_a2) < STILL_ACCEL_STD
             && (mean_g - self.bias).length() < BIAS_MAX_CORRECTION;
         if still {
-            let blend = if self.bias_calibrated { BIAS_BLEND } else { 1.0 };
+            let blend = if self.bias_calibrated {
+                BIAS_BLEND
+            } else {
+                1.0
+            };
             self.bias = self.bias.lerp(mean_g, blend);
             if !self.bias_calibrated {
                 eprintln!(
@@ -1352,6 +2091,11 @@ const REACH_STILL_GRAVITY_BAND: f32 = 0.5;
 
 /// Per-hand dead reckoning of the hand's translation from the accelerometer.
 ///
+/// **M2c: opt-in** (`JOYREACH_REACH=1`). M2a hardware testing showed that this cannot be made
+/// 1:1 without a much better gravity model, so the default is orientation-only arms and the
+/// palm beam owns distance. The tracker stays here for A/B experiments; the only M2c change is
+/// that it applies the per-axis calibration to its samples.
+///
 /// `a_lin = (yaw_offset · q) · accel − ĝ·Y`, where `ĝ` is this hand's measured gravity
 /// magnitude (Joy-Cons differ: ~10.06 m/s² for the left one and ~8.89 for the right one;
 /// subtracting a fixed 9.81 makes one hand sink and the other rise forever).
@@ -1383,10 +2127,17 @@ struct ReachTracker {
     win_a: Vec3,
     win_a2: Vec3,
     win_g: f32,
+    /// Optional per-axis accel correction (same file as the fusion).
+    calib: Option<AccelCalib>,
 }
 
 impl ReachTracker {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_calibration(None)
+    }
+
+    fn with_calibration(calib: Option<AccelCalib>) -> Self {
         Self {
             offset: Vec3::ZERO,
             velocity: Vec3::ZERO,
@@ -1399,6 +2150,7 @@ impl ReachTracker {
             win_a: Vec3::ZERO,
             win_a2: Vec3::ZERO,
             win_g: 0.0,
+            calib,
         }
     }
 
@@ -1409,9 +2161,14 @@ impl ReachTracker {
         self.still = false;
     }
 
-    /// One IMU sample. `accel`/`gyro` are body space; `orientation` is the yaw-recentered
-    /// body→world rotation (`ImuFusion::orientation()`).
+    /// One IMU sample. `accel` is raw SDL device space (the tracker applies its own copy of the
+    /// accelerometer calibration, when present); `gyro` is body space and bias-corrected;
+    /// `orientation` is the yaw-recentered body→world rotation (`ImuFusion::orientation()`).
     fn push(&mut self, accel: Vec3, gyro: Vec3, orientation: Quat, ts_ns: u64) {
+        let accel = match self.calib {
+            Some(calib) => calib.apply(accel),
+            None => accel,
+        };
         let dt = match self.last_ts {
             None => None,
             Some(last) => {
@@ -1483,7 +2240,9 @@ impl ReachTracker {
 
         let n = self.win_n as f32;
         let mean_a = self.win_a / n;
-        let variance = (self.win_a2 / n - mean_a * mean_a).max(Vec3::ZERO).element_sum();
+        let variance = (self.win_a2 / n - mean_a * mean_a)
+            .max(Vec3::ZERO)
+            .element_sum();
         let quiet = self.win_n >= 5
             && self.win_g / n < REACH_STILL_GYRO
             && variance.sqrt() < REACH_STILL_ACCEL_STD;
@@ -1537,11 +2296,7 @@ mod tests {
     /// Feed `n` samples at 200 Hz with a fixed reading (body space; converted to SDL device space).
     fn feed(fusion: &mut ImuFusion, gyro_body: Vec3, accel_body: Vec3, ts: &mut u64, n: u32) {
         for _ in 0..n {
-            fusion.push(
-                body_to_device(gyro_body),
-                body_to_device(accel_body),
-                *ts,
-            );
+            fusion.push(body_to_device(gyro_body), body_to_device(accel_body), *ts);
             *ts += 5_000_000;
         }
     }
@@ -1623,13 +2378,7 @@ mod tests {
         assert_vec3(fusion.bias, Vec3::ZERO, 1e-6);
 
         // 1.0 s at exactly 1 rad/s about body +Y.
-        feed(
-            &mut fusion,
-            Vec3::Y,
-            Vec3::Y * GRAVITY,
-            &mut ts,
-            200,
-        );
+        feed(&mut fusion, Vec3::Y, Vec3::Y * GRAVITY, &mut ts, 200);
 
         let expected = Quat::from_rotation_y(1.0);
         let err = fusion.q.angle_between(expected).to_degrees();
@@ -1657,7 +2406,10 @@ mod tests {
             forward.x.abs() < 1e-3,
             "heading should be body -Z after recenter, got {forward}"
         );
-        assert!(forward.z < -0.9, "forward should point at the screen: {forward}");
+        assert!(
+            forward.z < -0.9,
+            "forward should point at the screen: {forward}"
+        );
 
         // World yaw rotation preserves the Y component (pitch/roll stay absolute).
         let tilted_up_after = out * Vec3::Y;
@@ -1681,10 +2433,7 @@ mod tests {
     #[test]
     fn stick_deadzone_and_y_flip() {
         assert_eq!(apply_stick_deadzone(Vec2::ZERO), Vec2::ZERO);
-        assert_eq!(
-            apply_stick_deadzone(Vec2::new(0.08, -0.08)),
-            Vec2::ZERO
-        );
+        assert_eq!(apply_stick_deadzone(Vec2::new(0.08, -0.08)), Vec2::ZERO);
         // Edge of the deadzone -> 0, rim -> 1, halfway rescaled.
         assert!(apply_stick_deadzone(Vec2::new(0.12, 0.0)).length() < 1e-6);
         assert_vec3(
@@ -1756,7 +2505,11 @@ mod tests {
             assert!(is_gyro(gyro), "{} should be a gyro", sensor_label(gyro));
         }
         for accel in [SDL_SENSOR_ACCEL, SDL_SENSOR_ACCEL_L, SDL_SENSOR_ACCEL_R] {
-            assert!(!is_gyro(accel), "{} should be an accel", sensor_label(accel));
+            assert!(
+                !is_gyro(accel),
+                "{} should be an accel",
+                sensor_label(accel)
+            );
         }
     }
 
@@ -1822,7 +2575,10 @@ mod tests {
         feed(&mut fusion, Vec3::Y * 0.3, Vec3::Y * GRAVITY, &mut ts, 400); // 2 s at 0.3 rad/s
         assert_vec3(fusion.bias, Vec3::ZERO, 1e-4);
         let yaw = fusion.q.to_euler(EulerRot::YXZ).0;
-        assert!((yaw - 0.6).abs() < 0.02, "expected 0.6 rad of yaw, got {yaw}");
+        assert!(
+            (yaw - 0.6).abs() < 0.02,
+            "expected 0.6 rad of yaw, got {yaw}"
+        );
     }
 
     // --- Reach (dead reckoning) -----------------------------------------------
@@ -1972,5 +2728,391 @@ mod tests {
         reach.reset();
         assert_eq!(reach.offset, Vec3::ZERO);
         assert_eq!(reach.velocity, Vec3::ZERO);
+    }
+
+    // --- M2c: per-axis calibration, motion-gated tilt, CSV replay -------------------------
+
+    /// Synthetic Joy-Con: per-axis scale/offset errors, gyro bias and white noise.
+    /// `raw()` returns exactly what SDL would hand the filters (raw device frame).
+    struct SimJoyCon {
+        truth: AccelCalib,
+        bias: Vec3,
+        seed: u32,
+    }
+
+    impl SimJoyCon {
+        fn new(seed: u32) -> Self {
+            Self {
+                // ±4 % scale and ~0.1-0.15 m/s² offset, like the measured Joy-Cons.
+                truth: AccelCalib {
+                    scale: Vec3::new(1.04, 0.97, 1.03),
+                    offset: Vec3::new(0.15, -0.12, 0.10),
+                },
+                bias: Vec3::new(0.010, -0.020, 0.005),
+                seed,
+            }
+        }
+
+        fn noise(&mut self, amp: f32) -> f32 {
+            // xorshift32: deterministic across runs, no rand crate.
+            self.seed ^= self.seed << 13;
+            self.seed ^= self.seed >> 17;
+            self.seed ^= self.seed << 5;
+            let unit = (self.seed >> 8) as f32 / 16_777_216.0; // [0, 1)
+            (unit * 2.0 - 1.0) * amp
+        }
+
+        fn raw_accel(&mut self, a_true_body: Vec3) -> Vec3 {
+            let raw = a_true_body / self.truth.scale + self.truth.offset;
+            raw + Vec3::new(self.noise(0.02), self.noise(0.02), self.noise(0.02))
+        }
+
+        /// `q` is the true body->world orientation, `omega` the true body angular velocity and
+        /// `linear_world` the true world-frame linear acceleration (0 = pure rotation).
+        fn raw(&mut self, q: Quat, omega: Vec3, linear_world: Vec3) -> (Vec3, Vec3) {
+            let a_true = q.conjugate() * (Vec3::Y * GRAVITY + linear_world);
+            let accel = self.raw_accel(a_true);
+            let gyro = omega
+                + self.bias
+                + Vec3::new(self.noise(0.004), self.noise(0.004), self.noise(0.004));
+            (gyro, accel)
+        }
+    }
+
+    fn tilt_error_deg(fusion: &ImuFusion) -> f32 {
+        // The true orientation in these tests is identity, so body +Y is the true up.
+        (fusion.q.conjugate() * Vec3::Y)
+            .angle_between(Vec3::Y)
+            .to_degrees()
+    }
+
+    fn yaw_delta_deg(a: Quat, b: Quat) -> f32 {
+        let ya = a.to_euler(EulerRot::YXZ).0.to_degrees();
+        let yb = b.to_euler(EulerRot::YXZ).0.to_degrees();
+        ((yb - ya + 180.0).rem_euclid(360.0)) - 180.0
+    }
+
+    #[test]
+    fn calibration_fit_recovers_simulated_scale_and_offset() {
+        let mut sim = SimJoyCon::new(42);
+        let truth = sim.truth;
+        // Six faces, 20 s of still samples each (means average the sensor noise down).
+        let mut means = Vec::new();
+        for up_body in [
+            Vec3::X,
+            Vec3::NEG_X,
+            Vec3::Y,
+            Vec3::NEG_Y,
+            Vec3::Z,
+            Vec3::NEG_Z,
+        ] {
+            let mut sum = Vec3::ZERO;
+            for _ in 0..4000 {
+                sum += sim.raw_accel(up_body * GRAVITY);
+            }
+            means.push(sum / 4000.0);
+        }
+
+        let (fit, before, after) = AccelCalib::fit(&means).expect("six faces must fit");
+        println!(
+            "[M2c] calib fit: scale=({:.5},{:.5},{:.5}) offset=({:+.5},{:+.5},{:+.5}) \
+             RMS {:.4} -> {:.4} m/s2",
+            fit.scale.x,
+            fit.scale.y,
+            fit.scale.z,
+            fit.offset.x,
+            fit.offset.y,
+            fit.offset.z,
+            before,
+            after
+        );
+
+        for axis in 0..3 {
+            let got = fit.scale[axis];
+            let want = truth.scale[axis];
+            let relative = ((got - want) / want).abs();
+            assert!(
+                relative < 0.01,
+                "scale[{axis}] recovered {got:.5}, true {want:.5} ({:.2}% off)",
+                relative * 100.0
+            );
+            let offset_error = (fit.offset[axis] - truth.offset[axis]).abs();
+            let offset_relative = offset_error / truth.offset[axis].abs().max(1e-6);
+            println!(
+                "[M2c] calib axis {axis}: scale error {:.3}%, offset error {offset_error:.6} m/s2 \
+                 ({:.3}%)",
+                relative * 100.0,
+                offset_relative * 100.0
+            );
+            assert!(
+                offset_relative < 0.01,
+                "offset[{axis}] recovered {:.5}, true {:.5} (error {offset_error:.5}, {:.2}%)",
+                fit.offset[axis],
+                truth.offset[axis],
+                offset_relative * 100.0
+            );
+        }
+        // The whole point: the residual after the fit is a small fraction of the raw one.
+        assert!(
+            after < before * 0.1,
+            "residual should collapse: {before:.4} -> {after:.4} m/s2"
+        );
+    }
+
+    #[test]
+    fn calib_collector_requires_stillness_and_diversity() {
+        let mut collector = CalibCollector::new();
+        let mut ts = 0u64;
+        // A wobbling window (even with a full 1 s) is not a still pose.
+        collector.begin_step();
+        for i in 0..240 {
+            let jitter = if i % 2 == 0 { 1.0 } else { -1.0 };
+            collector.push(ts, Vec3::Y * GRAVITY + Vec3::X * jitter, Vec3::ZERO);
+            ts += 5_000_000;
+        }
+        assert_eq!(collector.take_pose(), CalibPose::Waiting);
+
+        // A quiet window is accepted.
+        collector.begin_step();
+        for _ in 0..240 {
+            collector.push(ts, Vec3::Y * 9.9, Vec3::ZERO);
+            ts += 5_000_000;
+        }
+        assert!(matches!(collector.take_pose(), CalibPose::Accepted(_)));
+
+        // Repeating the same face is rejected, so the fit never gets a degenerate pose set.
+        collector.begin_step();
+        for _ in 0..240 {
+            collector.push(ts, Vec3::Y * 9.9, Vec3::ZERO);
+            ts += 5_000_000;
+        }
+        assert!(matches!(collector.take_pose(), CalibPose::Duplicate(_)));
+        assert_eq!(collector.poses().len(), 1);
+
+        // 90° away is a new pose.
+        collector.begin_step();
+        for _ in 0..240 {
+            collector.push(ts, Vec3::X * 9.9, Vec3::ZERO);
+            ts += 5_000_000;
+        }
+        assert!(matches!(collector.take_pose(), CalibPose::Accepted(_)));
+        assert_eq!(collector.poses().len(), 2);
+    }
+
+    #[test]
+    fn calibration_text_round_trips_and_rejects_garbage() {
+        let mut cal = ImuCalibration::default();
+        cal.hands[Hand::Left.index()] = Some(AccelCalib {
+            scale: Vec3::new(1.0312, 0.9871, 1.0043),
+            offset: Vec3::new(0.0812, -0.0420, 0.1130),
+        });
+        cal.hands[Hand::Right.index()] = Some(AccelCalib {
+            scale: Vec3::new(0.9550, 1.0402, 0.9910),
+            offset: Vec3::new(-0.1100, 0.0950, -0.0310),
+        });
+        let text = cal.to_text();
+        let parsed = ImuCalibration::parse_text(&text).expect("round trip");
+        assert_eq!(parsed.hands, cal.hands);
+
+        // Missing fields and unknown keys are errors, not silently-ignored lines.
+        assert!(ImuCalibration::parse_text("left scale 1 1\n").is_err());
+        assert!(ImuCalibration::parse_text("left offset 0 0 0\n").is_err());
+        assert!(ImuCalibration::parse_text("middle scale 1 1 1\n").is_err());
+        assert!(ImuCalibration::parse_text("left nope 1 1 1\n").is_err());
+        assert!(
+            ImuCalibration::parse_text("left scale 1 1 1\nleft offset 0 0 0\nright scale 1 1 1\n")
+                .is_err()
+        );
+    }
+
+    /// The acceptance A/B: a 2 s, 3 m/s² lateral shake (no rotation) must not tilt the pointer
+    /// while the hand turns/moves. `motion_gate = false` reproduces the pre-M2c filter.
+    #[test]
+    fn motion_gate_keeps_tilt_during_a_lateral_shake() {
+        let mut sim = SimJoyCon::new(99);
+        let truth = sim.truth;
+        let mut gated = ImuFusion::with_calibration(Some(truth));
+        let mut ungated = ImuFusion::with_calibration(Some(truth));
+        ungated.motion_gate = false;
+
+        let mut gated_max = 0.0_f32;
+        let mut ungated_max = 0.0_f32;
+        let mut gated_final = 0.0_f32;
+        let mut ungated_final = 0.0_f32;
+        let mut ts = 0u64;
+
+        // 1.5 s still (bias calibration), 2.0 s shake, 1.0 s settle.
+        for i in 0..900 {
+            let t = i as f32 / 200.0;
+            let linear = if (1.5..3.5).contains(&t) {
+                // +X for 1 s, then -X for 1 s: a persistent sideways pull each way.
+                Vec3::X * if t < 2.5 { 3.0 } else { -3.0 }
+            } else {
+                Vec3::ZERO
+            };
+            let (gyro, accel) = sim.raw(Quat::IDENTITY, Vec3::ZERO, linear);
+            gated.push(gyro, accel, ts);
+            ungated.push(gyro, accel, ts);
+
+            let ge = tilt_error_deg(&gated);
+            let ue = tilt_error_deg(&ungated);
+            if (1.5..3.5).contains(&t) {
+                gated_max = gated_max.max(ge);
+                ungated_max = ungated_max.max(ue);
+            }
+            if (t - 3.5).abs() < 0.0026 {
+                gated_final = ge;
+                ungated_final = ue;
+            }
+            ts += 5_000_000;
+        }
+
+        println!(
+            "[M2c] lateral shake tilt error: gated max {gated_max:.2}° final {gated_final:.2}°; \
+             ungated (pre-M2c) max {ungated_max:.2}° final {ungated_final:.2}°"
+        );
+        assert!(
+            gated_max < 1.0,
+            "gated tilt error reached {gated_max:.2}° during the shake"
+        );
+        assert!(
+            ungated_max > 5.0,
+            "the ungated baseline should show the old tilt chase, got {ungated_max:.2}°"
+        );
+    }
+
+    /// The calibration must also restore the *orientation* input: feed a tilted pose through a
+    /// Joy-Con with 4 % axis errors and check the fused tilt with vs without the file.
+    #[test]
+    fn calibrated_accel_restores_tilt_at_rest() {
+        let mut sim = SimJoyCon::new(7);
+        let truth = sim.truth;
+        let pitch = 0.5_f32;
+        let q_true = Quat::from_rotation_x(pitch);
+        let mut calibrated = ImuFusion::with_calibration(Some(truth));
+        let mut raw_only = ImuFusion::with_calibration(None);
+        let mut ts = 0u64;
+        for _ in 0..600 {
+            let (gyro, accel) = sim.raw(q_true, Vec3::ZERO, Vec3::ZERO);
+            calibrated.push(gyro, accel, ts);
+            raw_only.push(gyro, accel, ts);
+            ts += 5_000_000;
+        }
+        let cal_err = calibrated.q.angle_between(q_true).to_degrees();
+        let raw_err = raw_only.q.angle_between(q_true).to_degrees();
+        println!("[M2c] tilted-pose error: calibrated {cal_err:.2}°, uncalibrated {raw_err:.2}°");
+        assert!(cal_err < 1.0, "calibrated tilt off by {cal_err:.2}°");
+        assert!(
+            raw_err > cal_err,
+            "the uncalibrated filter should be worse ({raw_err:.2}° vs {cal_err:.2}°)"
+        );
+    }
+
+    /// 20 s at rest: the variance-based gyro bias windows must keep working with calibration
+    /// applied (the old fix for "the hand drifts in yaw on its own" must not regress).
+    #[test]
+    fn calibrated_rest_keeps_yaw_drift_below_a_degree_over_20_s() {
+        let mut sim = SimJoyCon::new(123);
+        let truth = sim.truth;
+        let mut fusion = ImuFusion::with_calibration(Some(truth));
+        let mut ts = 0u64;
+        for _ in 0..400 {
+            let (gyro, accel) = sim.raw(Quat::IDENTITY, Vec3::ZERO, Vec3::ZERO);
+            fusion.push(gyro, accel, ts);
+            ts += 5_000_000;
+        }
+        let q0 = fusion.q;
+        for _ in 0..4000 {
+            let (gyro, accel) = sim.raw(Quat::IDENTITY, Vec3::ZERO, Vec3::ZERO);
+            fusion.push(gyro, accel, ts);
+            ts += 5_000_000;
+        }
+        let drift = yaw_delta_deg(q0, fusion.q);
+        let tilt = tilt_error_deg(&fusion);
+        println!("[M2c] 20 s calibrated rest: yaw drift {drift:+.3}°, tilt {tilt:.3}°");
+        assert!(drift.abs() < 1.0, "yaw drifted {drift:.3}° in 20 s at rest");
+        assert!(tilt < 1.0, "tilt drifted {tilt:.3}° in 20 s at rest");
+    }
+
+    /// Replay one hand from the `joycon_probe --record` CSV format through the real filter
+    /// chain. This is the hook for tuning against a real recording (rest / wrist rotation /
+    /// 30 cm push and stop) without the hardware attached.
+    #[cfg(test)]
+    fn replay_csv(csv: &str, hand: Hand, calib: Option<AccelCalib>) -> Vec<(u64, Vec3)> {
+        let mut fusion = ImuFusion::with_calibration(calib);
+        let mut reach = ReachTracker::with_calibration(calib);
+        let mut out = Vec::new();
+        for line in csv.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with("ts_ns") {
+                continue;
+            }
+            let fields: Vec<&str> = line.split(',').collect();
+            if fields.len() != 8 || fields[1] != hand.short() {
+                continue;
+            }
+            let ts = fields[0].parse::<u64>().expect("csv timestamp");
+            let values: Vec<f32> = fields[2..]
+                .iter()
+                .map(|value| value.parse::<f32>().expect("csv number"))
+                .collect();
+            let gyro = Vec3::new(values[0], values[1], values[2]);
+            let accel = Vec3::new(values[3], values[4], values[5]);
+            fusion.push(gyro, accel, ts);
+            reach.push(accel, gyro - fusion.bias, fusion.orientation(), ts);
+            out.push((ts, reach.offset));
+        }
+        out
+    }
+
+    #[test]
+    fn recorded_csv_replays_through_fusion_and_reach() {
+        let mut sim = SimJoyCon::new(3);
+        let truth = sim.truth;
+        let mut csv = String::from("ts_ns,hand,gx,gy,gz,ax,ay,az\n");
+        let mut ts = 0u64;
+        // 0.6 s rest so gravity/bias settle, 0.4 s forward push, 1.0 s still.
+        for i in 0..400 {
+            let t = i as f32 / 200.0;
+            let linear = if (0.6..1.0).contains(&t) {
+                let phase = (t - 0.6) / 0.4;
+                Vec3::NEG_Z * (10.0 * (std::f32::consts::PI * phase).sin())
+            } else {
+                Vec3::ZERO
+            };
+            let (gyro, accel) = sim.raw(Quat::IDENTITY, Vec3::ZERO, linear);
+            csv.push_str(&format!(
+                "{ts},L,{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}\n",
+                gyro.x, gyro.y, gyro.z, accel.x, accel.y, accel.z
+            ));
+            ts += 5_000_000;
+        }
+
+        let replay = replay_csv(&csv, Hand::Left, Some(truth));
+        assert_eq!(
+            replay.len(),
+            400,
+            "every row of the recorded hand must replay"
+        );
+        let final_reach = replay.last().unwrap().1;
+        println!(
+            "[M2c] csv replay: {} samples, final reach ({:+.3},{:+.3},{:+.3}) m",
+            replay.len(),
+            final_reach.x,
+            final_reach.y,
+            final_reach.z
+        );
+        assert!(
+            final_reach.z < -0.05,
+            "the recorded forward push should move the opt-in reach, got {final_reach}"
+        );
+
+        // And the calibration is really used by the replay path.
+        let uncalibrated = replay_csv(&csv, Hand::Left, None);
+        let alt = uncalibrated.last().unwrap().1;
+        println!(
+            "[M2c] csv replay without calibration: final reach z {:+.3} m",
+            alt.z
+        );
     }
 }

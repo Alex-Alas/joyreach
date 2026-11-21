@@ -17,6 +17,26 @@ cargo run --example joycon_probe -- --secs 20   # diagnóstico de los Joy-Con en
 
 Sin hardware: `$env:JOYREACH_FAKE='1'; cargo run` anima las manos con input falso (a los 2.2 s agarra un prop y lo muestra, para capturas). `cargo run -- --screenshot shot.png` guarda una captura a los 4 s y sale. `JOYREACH_PITCH=-70` arranca la cámara mirando a ese pitch (en grados), útil para capturar el agachado automático. `cargo run --example joycon_probe -- --secs 4 --rumble` prueba la vibración: izquierda y después derecha, 300 ms cada una.
 
+## Calibración del IMU
+
+Cada Joy-Con tiene errores de escala y offset distintos por eje (en reposo, el izquierdo mide ~10.1 m/s² y el derecho ~8.9 según la pose). Si solo se resta un escalar de gravedad, girar la muñeca se integra como una pequeña traslación y la mano "nada" sola. La calibración mide seis poses quietas por mano y guarda un ajuste por eje:
+
+```powershell
+cargo run --example joycon_probe -- --calibrate
+```
+
+Apoyá los dos Joy-Con juntos y seguí las seis poses que pide la consola (cara de botones arriba, abajo, los dos rieles y los dos extremos); cada una tiene que quedar quieta ~1 s. El probe exige que las poses sean distintas, imprime el RMS de `|a| − 9.80665` antes y después, y guarda `%LOCALAPPDATA%\joyreach\imu_calib.txt`. El juego lo carga al arrancar (`[joycon] accel calibration loaded` en stderr); si no existe, sigue con el fallback escalar anterior. Es opcional, pero hay dos mejoras de M2c que van juntas: la calibración deja `|a|` exacto en cualquier pose y el filtro deja de confiar en el acelerómetro mientras girás, para que la aceleración centrípeta no incline el puntero.
+
+Para grabar una sesión real (reposo, giro de muñeca, empuje de 30 cm y alto) y poder ajustar con datos:
+
+```powershell
+cargo run --example joycon_probe -- --secs 20 --record sesion.csv
+```
+
+El CSV guarda `ts_ns,hand,gx,gy,gz,ax,ay,az` por muestra cruda; los tests lo pueden reproducir por `ImuFusion` + `ReachTracker`.
+
+La profundidad IMU de la mano (`HandInput::reach`) es **opt-in**: se enciende con `$env:JOYREACH_REACH='1'`. Por defecto los brazos son solo orientación (la pose del modelo intacta) y la distancia va a manejarse con un rayo desde la palma, no con dead reckoning.
+
 ## Controles
 
 | Joy-Con | Acción |
@@ -34,8 +54,8 @@ Teclado y mouse para desarrollo: WASD para moverse, Space para saltar, C o Ctrl 
 
 ## Cómo funciona
 
-- **Input (`src/joycon.rs`):** SDL3 corre en su propio hilo con el driver HIDAPI de Switch. Integra cada muestra del IMU (~200–350 Hz por Bluetooth) con su marca de tiempo en un filtro Mahony por mano. La deriva del giroscopio se calibra sola cuando el control está quieto. El juego solo lee el recurso `Hands`. El HD Rumble va en sentido inverso: el juego escribe mensajes `Rumble` y el hilo de SDL los manda al Joy-Con que corresponde (en un par combinado, graves = izquierda, agudos = derecha; `SDL_hidapi_switch.c`).
-- **Brazos (`src/arms.rs`):** port del `GvrArmModel` de Google Daydream. Al inclinar el Joy-Con hacia arriba, el codo absorbe parte de la rotación y el brazo se estira, en vez de girar solo la muñeca. La profundidad real (empujar, jalar, golpear) sale de integrar la aceleración del IMU: el acelerómetro da el desplazamiento de la mano y, al quedarse quieta, la posición se congela (ZUPT) para que no derive; el codo se resuelve con IK analítica de dos huesos dentro del alcance del brazo. Cada mano es un cuerpo cinemático de avian3d que persigue su objetivo por velocidad, así los objetos reciben un empujón con inercia real. Si mirás abajo de −20°, todo el ancla de los hombros baja y avanza con la mirada.
+- **Input (`src/joycon.rs`):** SDL3 corre en su propio hilo con el driver HIDAPI de Switch. Integra cada muestra del IMU (~200–350 Hz por Bluetooth) con su marca de tiempo en un filtro Mahony por mano. La deriva del giroscopio se calibra sola cuando el control está quieto y la corrección de tilt del acelerómetro se atenúa mientras la mano gira (así el puntero no se inclina con la aceleración centrípeta). Con `--calibrate`, un ajuste por eje del acelerómetro deja `|a| = 9.80665 m/s²` en cualquier orientación; el archivo se carga al arrancar. El juego solo lee el recurso `Hands`. El HD Rumble va en sentido inverso: el juego escribe mensajes `Rumble` y el hilo de SDL los manda al Joy-Con que corresponde (en un par combinado, graves = izquierda, agudos = derecha; `SDL_hidapi_switch.c`).
+- **Brazos (`src/arms.rs`):** port del `GvrArmModel` de Google Daydream. Al inclinar el Joy-Con hacia arriba, el codo absorbe parte de la rotación y el brazo se estira, en vez de girar solo la muñeca. Por defecto el brazo es **solo orientación**: `HandInput::reach` queda en cero y la pose es exactamente la del modelo. La profundidad IMU de M2a sigue disponible con `JOYREACH_REACH=1` (acelerómetro integrado, ZUPT al quedarse quieto, tope de 0.35 m); el codo se resuelve con IK analítica de dos huesos hacia la muñeca desplazada. Cada mano es un cuerpo cinemático de avian3d que persigue su objetivo por velocidad, así los objetos reciben un empujón con inercia real. Si mirás abajo de −20°, todo el ancla de los hombros baja y avanza con la mirada.
 - **Agarre (`src/grab.rs`):** en el borde de ZL/ZR busca el prop cuyo collider esté a ≤12 cm de la palma (la mano más cercana gana si ambas lo alcanzan). Al agarrarlo lo acomoda en la palma en ~80 ms y después le fija la velocidad con un límite de 60 N: la mesa puede bloquearlo y lo pesado (~3 kg) se queda atrás mientras lo liviano (~0.3 kg) va pegado. Al soltar lo lanza con el promedio de la velocidad de la mano en los últimos 5 pasos × 1.1 (máx. 12 m/s). El contorno es un casco invertido del mismo mesh, sin luz, del color de la mano.
 - **Cuerpo (`src/player.rs`):** cápsula cinemática de 1.75 m (radio 0.25) movida con `move_and_slide` de avian: gravedad, detección de piso por shape cast y colisión-deslizamiento contra el banco, los parapetos, las cajas y los maceteros. Los props livianos que se cruzan reciben un empujón acotado (nunca empujan al jugador). Salto de ~0.6 m con 0.1 s de coyote; al agacharse la cápsula baja a 1.10 m y los ojos a 0.95 m (o hasta 0.90 m mirando abajo), con el mismo suavizado de ~150 ms.
 - **Mundo (`src/world.rs`):** terraza con cielo atmosférico, sol a 55° para que la sombra de la mano diga su profundidad, y física a 120 Hz.

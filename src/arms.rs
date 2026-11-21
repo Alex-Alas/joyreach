@@ -583,7 +583,7 @@ fn update_arms(
         } else {
             Quat::IDENTITY
         };
-        let reach = if input.connected {
+        let reach = if input.connected && crate::joycon::reach_enabled() {
             input.reach
         } else {
             Vec3::ZERO
@@ -932,7 +932,7 @@ fn drive_hand_bodies(
         } else {
             Quat::IDENTITY
         };
-        let reach = if input.connected {
+        let reach = if input.connected && crate::joycon::reach_enabled() {
             input.reach
         } else {
             Vec3::ZERO
@@ -1198,6 +1198,37 @@ mod tests {
         let pose = solve_arm_with_reach(HandSide::Right, Quat::IDENTITY, Vec3::ZERO);
         assert!((pose.wrist - base.wrist).length() < 1e-6);
         assert!((pose.hand - base.hand).length() < 1e-6);
+    }
+
+    /// M2c measurement (no fix): how much of the 0.35 m reach the Daydream neutral pose can
+    /// actually follow forward vs backward. The neutral wrist already sits 0.415 m from the
+    /// shoulder of a 0.553 m arm, so a forward target hits the elbow's max extension early
+    /// while backward travel is not limited. Reported in the M2c notes and used to decide
+    /// whether the opt-in reach ever needs a shoulder-lean fix.
+    #[test]
+    fn forward_ik_travel_at_neutral_is_measured() {
+        let base = solve_arm(HandSide::Right, Quat::IDENTITY);
+        let forward = solve_arm_with_reach(
+            HandSide::Right,
+            Quat::IDENTITY,
+            Vec3::new(0.0, 0.0, -REACH_IK_MAX),
+        );
+        let backward = solve_arm_with_reach(
+            HandSide::Right,
+            Quat::IDENTITY,
+            Vec3::new(0.0, 0.0, REACH_IK_MAX),
+        );
+        let forward_hand = base.hand.z - forward.hand.z;
+        let backward_hand = backward.hand.z - base.hand.z;
+        let forward_wrist = base.wrist.z - forward.wrist.z;
+        let backward_wrist = backward.wrist.z - base.wrist.z;
+        println!(
+            "[M2c] neutral IK travel forward: hand {forward_hand:.3} m / wrist {forward_wrist:.3} m; \
+             backward: hand {backward_hand:.3} m / wrist {backward_wrist:.3} m"
+        );
+        // Both directions move, and the forward range is the ~0.21 m measured on 2026-11-21.
+        assert!(forward_hand > 0.20, "forward travel dropped to {forward_hand}");
+        assert!(backward_hand > 0.30, "backward travel dropped to {backward_hand}");
     }
 
     #[test]

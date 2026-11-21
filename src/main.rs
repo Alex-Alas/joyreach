@@ -3,6 +3,7 @@
 //! Dev flags:
 //! - `--screenshot <path>`: let the scene settle for ~4 s, save the primary window, exit.
 //! - `JOYREACH_FAKE=1`: drive both hands with animated fake input (no hardware).
+//! - `JOYREACH_REACH=1`: opt in to IMU hand depth (off by default; orientation-only otherwise).
 
 mod arms;
 mod grab;
@@ -125,16 +126,20 @@ fn fake_hands(mut hands: ResMut<Hands>, mut fake: ResMut<FakeHands>, time: Res<T
         hand.menu = false;
         hand.gyro = Vec3::ZERO;
         hand.accel = Vec3::new(0.0, 9.81, 0.0);
-        // M2a: a slow forward/back reach so screenshots show IMU depth + the IK elbow.
-        // 0..0.35 m forward (-Z), both hands slightly out of phase; the `--screenshot`
-        // moment (~4 s) catches the right arm near full extension.
-        let reach_wave = (t * 0.75 - index as f32 * 0.9).sin();
-        hand.reach = Vec3::new(0.0, 0.02 * reach_wave, -(0.18 + 0.17 * reach_wave));
-        hand.reach_velocity = Vec3::new(
-            0.0,
-            0.0,
-            -0.17 * 0.75 * (t * 0.75 - index as f32 * 0.9).cos(),
-        );
+        // M2c: depth is opt-in. The fake demo must obey the same switch, otherwise the
+        // screenshot would show a reach that the real input path never publishes.
+        if joycon::reach_enabled() {
+            let reach_wave = (t * 0.75 - index as f32 * 0.9).sin();
+            hand.reach = Vec3::new(0.0, 0.02 * reach_wave, -(0.18 + 0.17 * reach_wave));
+            hand.reach_velocity = Vec3::new(
+                0.0,
+                0.0,
+                -0.17 * 0.75 * (t * 0.75 - index as f32 * 0.9).cos(),
+            );
+        } else {
+            hand.reach = Vec3::ZERO;
+            hand.reach_velocity = Vec3::ZERO;
+        }
     }
     fake.0 = hands.clone();
 }
