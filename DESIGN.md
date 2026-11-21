@@ -69,6 +69,14 @@ Escala humana real (metros). Props de 8–15 cm: del tamaño de algo que agarras
   Malla del `generic-hand` de WebXR (W3C, crédito en README), material reemplazado por `glove`; las juntas de los dedos se articulan por gatillo y el pulgar queda hacia adentro.
 - **Gatillo = puño:** los dedos se cierran en ~80 ms con ease-out; al soltar, se abren en ~120 ms. Es la confirmación visual del agarre.
 - **Profundidad (M2c: opt-in, apagada por defecto):** la mano ya no persigue distancia por IMU salvo que se pida con `JOYREACH_REACH=1`; por defecto el brazo es solo orientación y la distancia la resolverá el rayo de la palma. La calibración por eje (`cargo run --example joycon_probe -- --calibrate`, archivo `%LOCALAPPDATA%\joyreach\imu_calib.txt`) corrige escala y offset para que `|a| = 9.80665` en cualquier pose; sin archivo queda el fallback escalar de M2a. La corrección de tilt de Mahony se atenúa mientras la mano gira (y, con calibración, cuando `|a|` se aleja de 1 g), para que la aceleración centrípeta no incline el puntero. El dead reckoning de M2a (banda muerta 0.15 m/s², fuga de velocidad τ = 0.5 s, ZUPT tras 60 ms quieto, tope de 0.35 m y retorno τ = 3.5 s) sigue detrás del flag solo para A/B. El codo se resuelve con IK analítica de dos huesos hacia la muñeca desplazada, dentro del alcance real del brazo.
+
+### 7.1 Rayo de la palma (M2d)
+
+- El rayo es la mano extendida, no un arma: sale de la palma, usa el color de esa mano y es emisivo para que el bloom lo marque. Nunca es decoración del mundo.
+- Apuntando: solo se dibuja si toca un prop agarrable, fino (3.5 mm) y tenue (alfa 0.38), con un punto de 13 mm en el impacto.
+- Sosteniendo: más grueso (7 mm), opaco y brillante, con un punto de 20 mm sobre el prop; la mano cierra el puño.
+- Agarre directo primero: si hay un prop a ≤12 cm de la palma, gana la mano y el rayo no aparece.
+- Vibración corta al enganchar (0.5, 22 ms), más suave que el agarre directo.
 - **Alcance:** mirar por debajo de −20° inclina el torso (hombros y manos bajan 35 cm y avanzan 25 cm, suavizado ~100 ms) para llegar a lo que muestra la cámara. A 0° el desplazamiento es cero.
 - Desconectado: el brazo queda en reposo y la manga baja a 50 % de saturación. Sin mensajes de error en el mundo.
 - Cerca de la cámara: se oculta el **brazo superior** mientras su hombro esté a menos de ~0.3 m del ojo (a 20 cm una manga de 10 cm ocupa un cuadro entero abajo a los lados); reaparece a ~0.5 m al inclinarse. La mano se desvanece si se acerca a la cara (escala), no atraviesa la cámara.

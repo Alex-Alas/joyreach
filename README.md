@@ -47,7 +47,9 @@ La profundidad IMU de la mano (`HandInput::reach`) es **opt-in**: se enciende co
 | B (Joy-Con R) o Space | Saltar (~0.6 m de alto), solo desde el piso |
 | Clic del stick izquierdo (o C / Ctrl) | Agacharse fijo: los ojos bajan a ~0.95 m y el paso se hace más lento |
 | Mirar hacia abajo (−35° a −80°) | Agacharse automático hasta ~0.90 m: las manos bajan con los ojos hasta el piso |
-| ZL / ZR | Cerrar la mano: agarra el prop más cercano (contorno del color de la mano); al soltar, lo lanza |
+| ZL / ZR | Agarrar: si el prop está a ≤12 cm de la palma lo toma la mano; si no, el rayo de la palma lo toma a distancia (hasta 8 m). Al soltar, lo lanza |
+| Girar la muñeca con un prop en el rayo | El prop rota igual que la mano |
+| ↑ / ↓ (Joy-Con L) · X / Y (Joy-Con R), o E / Q | Alejar / acercar el prop que sostiene el rayo (0.35–8 m, 1.5 m/s) |
 | Mirar hacia abajo (>20°) | El torso se inclina y las manos alcanzan donde mirás |
 
 Teclado y mouse para desarrollo: WASD para moverse, Space para saltar, C o Ctrl para agacharse, y clic para capturar el mouse (Esc lo suelta).
@@ -57,6 +59,7 @@ Teclado y mouse para desarrollo: WASD para moverse, Space para saltar, C o Ctrl 
 - **Input (`src/joycon.rs`):** SDL3 corre en su propio hilo con el driver HIDAPI de Switch. Integra cada muestra del IMU (~200–350 Hz por Bluetooth) con su marca de tiempo en un filtro Mahony por mano. La deriva del giroscopio se calibra sola cuando el control está quieto y la corrección de tilt del acelerómetro se atenúa mientras la mano gira (así el puntero no se inclina con la aceleración centrípeta). Con `--calibrate`, un ajuste por eje del acelerómetro deja `|a| = 9.80665 m/s²` en cualquier orientación; el archivo se carga al arrancar. El juego solo lee el recurso `Hands`. El HD Rumble va en sentido inverso: el juego escribe mensajes `Rumble` y el hilo de SDL los manda al Joy-Con que corresponde (en un par combinado, graves = izquierda, agudos = derecha; `SDL_hidapi_switch.c`).
 - **Brazos (`src/arms.rs`):** port del `GvrArmModel` de Google Daydream. Al inclinar el Joy-Con hacia arriba, el codo absorbe parte de la rotación y el brazo se estira, en vez de girar solo la muñeca. Por defecto el brazo es **solo orientación**: `HandInput::reach` queda en cero y la pose es exactamente la del modelo. La profundidad IMU de M2a sigue disponible con `JOYREACH_REACH=1` (acelerómetro integrado, ZUPT al quedarse quieto, tope de 0.35 m); el codo se resuelve con IK analítica de dos huesos hacia la muñeca desplazada. Cada mano es un cuerpo cinemático de avian3d que persigue su objetivo por velocidad, así los objetos reciben un empujón con inercia real. Si mirás abajo de −20°, todo el ancla de los hombros baja y avanza con la mirada.
 - **Agarre (`src/grab.rs`):** en el borde de ZL/ZR busca el prop cuyo collider esté a ≤12 cm de la palma (la mano más cercana gana si ambas lo alcanzan). Al agarrarlo lo acomoda en la palma en ~80 ms y después le fija la velocidad con un límite de 60 N: la mesa puede bloquearlo y lo pesado (~3 kg) se queda atrás mientras lo liviano (~0.3 kg) va pegado. Al soltar lo lanza con el promedio de la velocidad de la mano en los últimos 5 pasos × 1.1 (máx. 12 m/s). El contorno es un casco invertido del mismo mesh, sin luz, del color de la mano.
+- **Rayo de la palma (`src/handray.rs`, `src/grab.rs`):** cada mano lanza un rayo desde la palma en la dirección a la que apunta el Joy-Con. Solo usa la orientación, que es lo que el IMU mide bien, así que no deriva. Si no hay nada al alcance de la mano, ZL/ZR toma el prop que toca el rayo y lo sostiene a esa distancia con el mismo resorte de 60 N: los objetos pesados se retrasan. La rotación de la mano desde el agarre se aplica al prop. Al soltar conserva su velocidad (× 1.1), así que un golpe de muñeca lo lanza. El mismo `HandRay` será el puntero de las ventanas en M3.
 - **Cuerpo (`src/player.rs`):** cápsula cinemática de 1.75 m (radio 0.25) movida con `move_and_slide` de avian: gravedad, detección de piso por shape cast y colisión-deslizamiento contra el banco, los parapetos, las cajas y los maceteros. Los props livianos que se cruzan reciben un empujón acotado (nunca empujan al jugador). Salto de ~0.6 m con 0.1 s de coyote; al agacharse la cápsula baja a 1.10 m y los ojos a 0.95 m (o hasta 0.90 m mirando abajo), con el mismo suavizado de ~150 ms.
 - **Mundo (`src/world.rs`):** terraza con cielo atmosférico, sol a 55° para que la sombra de la mano diga su profundidad, y física a 120 Hz.
 - **Diseño:** [`DESIGN.md`](DESIGN.md) es el sistema visual. Solo las mangas van saturadas, con el rojo y el azul de cada Joy-Con. [`docs/BRIEF.md`](docs/BRIEF.md) tiene el brief técnico.
@@ -67,6 +70,7 @@ Stack: Rust, Bevy 0.20, avian3d 0.8 y SDL3 (`sdl3-sys`, estático).
 
 - [x] **M0 — brazos vivos:** escena, cámara, brazos con los Joy-Con reales, empujar objetos.
 - [x] **M1 — agarrar y lanzar** con ZL/ZR, contorno del color de la mano, HD Rumble y torso que se inclina al mirar abajo.
+- [x] **M2 (parcial) — cuerpo y rayo:** cápsula con física, salto y agacharse; calibración del IMU; rayo de la palma para agarrar a distancia.
 - [ ] **M2 — locomoción:** saltar, escalar, flotar.
 - [ ] **M3 — una ventana de escritorio** capturada (Windows.Graphics.Capture) en un panel 3D.
 - [ ] **M4 — navegador embebido** (CEF) interactivo.

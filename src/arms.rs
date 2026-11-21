@@ -507,6 +507,8 @@ fn setup_arms(
         };
         commands.spawn((
             HandBody { side },
+            // M2d: the palm ray every hand always carries (grab now, M3 pointer later).
+            crate::handray::HandRay::default(),
             Transform::from_translation(position).with_rotation(rest.hand_rotation),
             Position(position),
             Rotation(rest.hand_rotation),

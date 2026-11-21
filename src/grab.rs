@@ -2,6 +2,13 @@
 //! force-limited velocity tracker so the table and other props can block it, and the
 //! release throws it with the hand's recent velocity.
 //!
+//! M2d adds the palm beam: if nothing is inside the direct-grab radius but the hand's
+//! [`HandRay`](crate::handray::HandRay) hits a dynamic prop, the hand grabs it at that
+//! distance physics-gun style. The prop is pulled to the beam point by the same force-limited
+//! tracker, its rotation follows the wrist (delta since grab), and the D-pad / X-Y push and
+//! pull it between 0.35 m and 8 m. A thin hand-coloured beam and a hit dot show the aim
+//! (DESIGN §7.1), and the existing inverted-hull outline marks the hover target.
+//!
 //! Also here: the hand-coloured grab outline (DESIGN §8) and the HD Rumble triggers
 //! (DESIGN §9). The outline is an inverted hull (back faces of a slightly larger copy
 //! of the prop mesh, unlit) — one child per hand so each hand owns its colour.
@@ -10,10 +17,12 @@
 //! below only feed them.
 
 use avian3d::prelude::*;
+use bevy::light::NotShadowCaster;
 use bevy::prelude::*;
 use bevy::render::render_resource::Face;
 
 use crate::arms::{HAND_LAYER_LEFT, HAND_LAYER_RIGHT, HandBody, HandMotion, HandSide};
+use crate::handray::{HAND_RAY_MAX, HandRay};
 use crate::joycon::{Hands, Rumble, RumbleHand};
 use crate::theme;
 
@@ -41,9 +50,25 @@ pub const OUTLINE_THICKNESS: f32 = 0.004;
 /// Outline fade after release (DESIGN §8: 150 ms).
 pub const OUTLINE_FADE: f32 = 0.15;
 
+/// Beam hold distance limits (DESIGN §7.1).
+pub const BEAM_MIN_DISTANCE: f32 = 0.35;
+pub const BEAM_MAX_DISTANCE: f32 = HAND_RAY_MAX;
+/// Push/pull rate while a beam holds a prop: D-pad ↑/↓ (left hand) or X/Y (right hand).
+pub const BEAM_PUSH_PULL_SPEED: f32 = 1.5;
+/// Idle beam/dot size and glow, and the brighter/thicker held state (DESIGN §7.1).
+const BEAM_RADIUS_IDLE: f32 = 0.0035;
+const BEAM_RADIUS_HOLD: f32 = 0.007;
+const BEAM_DOT_RADIUS_IDLE: f32 = 0.013;
+const BEAM_DOT_RADIUS_HOLD: f32 = 0.020;
+const BEAM_GLOW_IDLE: f32 = 2.4;
+const BEAM_GLOW_HOLD: f32 = 6.0;
+const BEAM_ALPHA_IDLE: f32 = 0.38;
+
 /// HD Rumble feel. Strength is 0..1.
 const RUMBLE_GRAB: (f32, u32) = (0.9, 40);
 const RUMBLE_THROW: (f32, u32) = (0.55, 15);
+/// Beam lock: a short tick, shorter than the direct grab pulse.
+const RUMBLE_BEAM: (f32, u32) = (0.5, 22);
 /// Impact pulses: 10–40 ms, proportional to the relative speed.
 const RUMBLE_TOUCH_MIN_MS: u32 = 10;
 const RUMBLE_TOUCH_MAX_MS: u32 = 40;
@@ -94,6 +119,73 @@ pub fn resolve_claims<T: Copy + PartialEq>(
 /// Move a velocity toward `desired` by at most `max_delta` (the force limit).
 pub fn limited_velocity_step(current: Vec3, desired: Vec3, max_delta: f32) -> Vec3 {
     current + (desired - current).clamp_length_max(max_delta)
+}
+
+/// Which grab wins when a hand can both touch and aim at a prop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrabKind {
+    /// The prop is inside [`GRAB_RADIUS`] of the palm: M1 grip snap, unchanged.
+    Direct,
+    /// The palm ray hit a dynamic prop further out: physics-gun hold.
+    Beam,
+}
+
+/// Direct wins when the palm is actually touching something; otherwise the beam wins when the
+/// ray reached a prop; otherwise the hand grabs nothing. Pure so the precedence is tested.
+pub fn select_grab(
+    direct_distance: Option<f32>,
+    beam_distance: Option<f32>,
+    radius: f32,
+) -> Option<GrabKind> {
+    if direct_distance.is_some_and(|distance| distance <= radius) {
+        Some(GrabKind::Direct)
+    } else if beam_distance.is_some_and(|distance| distance >= 0.0) {
+        Some(GrabKind::Beam)
+    } else {
+        None
+    }
+}
+
+/// Point on the beam at `hold_distance` from the palm. The prop's grabbed local point is
+/// driven to this; the prop centre then hangs off it by the grab offset.
+pub fn beam_target(origin: Vec3, direction: Vec3, hold_distance: f32) -> Vec3 {
+    origin + direction.normalize_or_zero() * hold_distance.max(0.0)
+}
+
+/// Push/pull one fixed step. Positive `axis` moves the target away from the palm.
+pub fn adjust_hold_distance(distance: f32, axis: f32, dt: f32) -> f32 {
+    let step = axis.clamp(-1.0, 1.0) * BEAM_PUSH_PULL_SPEED * dt.max(0.0);
+    (distance + step).clamp(BEAM_MIN_DISTANCE, BEAM_MAX_DISTANCE)
+}
+
+/// Prop rotation while beam-held: the hand's rotation since grab, applied to the prop's
+/// rotation at grab. A wrist twist therefore rotates the object 1:1.
+pub fn beam_rotation(hand_now: Quat, hand_at_grab: Quat, prop_at_grab: Quat) -> Quat {
+    ((hand_now * hand_at_grab.inverse()) * prop_at_grab).normalize()
+}
+
+/// World-space point of the prop that was grabbed, from its current centre and rotation.
+pub fn held_point(center: Vec3, rotation: Quat, local_offset: Vec3) -> Vec3 {
+    center + rotation * local_offset
+}
+
+/// Push/pull intent from the face buttons: left D-pad up/down, right X/Y.
+/// Returns +1 away, −1 closer, 0 when neither/both are pressed.
+pub fn push_pull_axis(side: HandSide, face: [bool; 4]) -> f32 {
+    let (away, closer) = match side {
+        // Left face order is [up, down, left, right].
+        HandSide::Left => (face[0], face[1]),
+        // Right face order is [X, B, Y, A]: B is the jump button, so X and Y are used.
+        HandSide::Right => (face[0], face[2]),
+    };
+    let mut axis = 0.0;
+    if away {
+        axis += 1.0;
+    }
+    if closer {
+        axis -= 1.0;
+    }
+    axis
 }
 
 /// Average of the hand velocity history × gain, clamped to `max_speed`.
@@ -228,14 +320,33 @@ impl OutlineMaterials {
 pub struct Grabbable;
 
 #[derive(Clone, Copy, Debug)]
+enum HoldKind {
+    /// M1: the prop is snapped into the palm and follows the hand frame.
+    Direct {
+        /// Prop centre in hand space: starts where the hand found it and eases into `grip`.
+        offset: Vec3,
+        /// Where the prop should sit once the grab settles (in the palm).
+        grip: Vec3,
+        /// Prop orientation in hand space, captured at grab time.
+        rotation_offset: Quat,
+    },
+    /// M2d: the prop hangs off the palm ray at the distance it was grabbed.
+    Beam {
+        /// Distance from the palm to the grabbed point, along the ray.
+        distance: f32,
+        /// Grabbed point in the prop's local frame (no jump at capture, and it rotates with it).
+        local_offset: Vec3,
+        /// Hand orientation at grab; the wrist delta since then drives the prop.
+        hand_rotation: Quat,
+        /// Prop orientation at grab.
+        prop_rotation: Quat,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
 struct HeldProp {
     entity: Entity,
-    /// Prop centre in hand space: starts where the hand found it and eases into `grip`.
-    offset: Vec3,
-    /// Where the prop should sit once the grab settles (in the palm).
-    grip: Vec3,
-    /// Prop orientation in hand space, captured at grab time.
-    rotation_offset: Quat,
+    hold: HoldKind,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -310,6 +421,88 @@ impl GrabState {
     }
 }
 
+// --- Beam visuals (DESIGN §7.1) ----------------------------------------------
+
+/// One of the two meshes that draw a hand's beam: the thin cylinder or the hit dot.
+#[derive(Component, Clone, Copy)]
+struct BeamVisual {
+    side: HandSide,
+    dot: bool,
+}
+
+/// Shared beam material per hand. Only one beam per hand is ever visible, so mutating the
+/// single material's alpha/emissive per frame is enough (same trick as the outline).
+#[derive(Resource, Clone)]
+struct BeamMaterials {
+    handles: [Handle<StandardMaterial>; 2],
+    colors: [Color; 2],
+}
+
+/// The per-hand beam pose for this frame, computed once and shared by beam + dot.
+#[derive(Clone, Copy, Debug, Default)]
+struct BeamPose {
+    visible: bool,
+    origin: Vec3,
+    end: Vec3,
+    holding: bool,
+}
+
+fn beam_material(color: Color) -> StandardMaterial {
+    // Lit (black base) rather than unlit: Bevy's unlit path ignores `emissive`, and the beam
+    // leans on emissive for bloom. A black, fully rough surface contributes no lighting of
+    // its own, so only the hand colour remains.
+    let linear = color.to_linear();
+    StandardMaterial {
+        base_color: Color::srgba(0.0, 0.0, 0.0, BEAM_ALPHA_IDLE),
+        emissive: LinearRgba::rgb(
+            linear.red * BEAM_GLOW_IDLE,
+            linear.green * BEAM_GLOW_IDLE,
+            linear.blue * BEAM_GLOW_IDLE,
+        ),
+        perceptual_roughness: 1.0,
+        metallic: 0.0,
+        reflectance: 0.0,
+        alpha_mode: AlphaMode::Blend,
+        fog_enabled: false,
+        ..default()
+    }
+}
+
+fn setup_beams(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    // A thin cylinder (radius 0.5 × scale) stretched between palm and target.
+    let beam_mesh = meshes.add(Cylinder::new(0.5, 1.0).mesh().resolution(8));
+    let dot_mesh = meshes.add(Sphere::new(0.5).mesh().uv(10, 6));
+
+    let colors = [theme::JOY_LEFT, theme::JOY_RIGHT];
+    let handles = [
+        materials.add(beam_material(colors[0])),
+        materials.add(beam_material(colors[1])),
+    ];
+
+    for side in [HandSide::Left, HandSide::Right] {
+        for dot in [false, true] {
+            commands.spawn((
+                BeamVisual { side, dot },
+                Mesh3d(if dot {
+                    dot_mesh.clone()
+                } else {
+                    beam_mesh.clone()
+                }),
+                MeshMaterial3d(handles[side.index()].clone()),
+                Transform::default(),
+                Visibility::Hidden,
+                NotShadowCaster,
+            ));
+        }
+    }
+
+    commands.insert_resource(BeamMaterials { handles, colors });
+}
+
 // --- ECS ----------------------------------------------------------------------
 
 pub struct GrabPlugin;
@@ -317,45 +510,79 @@ pub struct GrabPlugin;
 impl Plugin for GrabPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<GrabState>()
+            .add_systems(Startup, setup_beams)
             .add_systems(
                 Update,
-                (update_outlines, rumble_on_impact, tick_impact_cooldowns).chain(),
+                (
+                    update_outlines,
+                    update_beams,
+                    rumble_on_impact,
+                    tick_impact_cooldowns,
+                )
+                    .chain(),
             )
-            .add_systems(FixedUpdate, drive_grabs.after(crate::arms::HandBodiesSet));
+            .add_systems(
+                FixedUpdate,
+                drive_grabs
+                    .after(crate::arms::HandBodiesSet)
+                    .after(crate::handray::HandRaySet),
+            );
     }
 }
 
+/// Snapshot of a grabbable prop: entity, centre, rotation, collider, dynamic.
+type PropSnapshot = Vec<(Entity, Vec3, Quat, Collider, bool)>;
+
 /// Snapshot the props so both hands test the same list in one pass.
 fn prop_snapshot(
-    props: &Query<(Entity, &Position, &Rotation, &Collider), With<Grabbable>>,
-) -> Vec<(Entity, Vec3, Quat, Collider)> {
+    props: &Query<(Entity, &Position, &Rotation, &Collider, &RigidBody), With<Grabbable>>,
+) -> PropSnapshot {
     props
         .iter()
-        .map(|(entity, position, rotation, collider)| {
-            (entity, position.0, rotation.0, collider.clone())
+        .map(|(entity, position, rotation, collider, body)| {
+            (
+                entity,
+                position.0,
+                rotation.0,
+                collider.clone(),
+                body.is_dynamic(),
+            )
         })
         .collect()
 }
 
 /// Best candidate for one hand, shared by the outline (Update) and the grab (fixed).
-fn candidate_for(palm: Vec3, props: &[(Entity, Vec3, Quat, Collider)]) -> Option<(Entity, f32)> {
+fn candidate_for(palm: Vec3, props: &[(Entity, Vec3, Quat, Collider, bool)]) -> Option<(Entity, f32)> {
     nearest_candidate(
         GRAB_RADIUS,
-        props.iter().map(|(entity, position, rotation, collider)| {
+        props.iter().map(|(entity, position, rotation, collider, _)| {
             (*entity, palm_to_prop(palm, *position, *rotation, collider))
         }),
     )
 }
 
+/// Beam candidate: the ray must end on a dynamic, grabbable prop. Static geometry (bench,
+/// deck, parapets) blocks the beam but is not a target, so aiming at the table gives nothing.
+fn beam_candidate(ray: &HandRay, props: &[(Entity, Vec3, Quat, Collider, bool)]) -> Option<(Entity, f32)> {
+    let hit = ray.hit?;
+    if hit.distance > BEAM_MAX_DISTANCE {
+        return None;
+    }
+    let (_, _, _, _, dynamic) = props.iter().find(|(entity, ..)| *entity == hit.entity)?;
+    dynamic.then_some((hit.entity, hit.distance))
+}
+
 /// Per fixed step: input edges, force-limited tracking of the held prop, throw.
+#[allow(clippy::too_many_arguments)]
 fn drive_grabs(
     mut commands: Commands,
     time: Res<Time<Fixed>>,
     hands: Res<Hands>,
     fake: Option<Res<crate::FakeHands>>,
     motion: Res<HandMotion>,
+    keys: Res<ButtonInput<KeyCode>>,
     mut state: ResMut<GrabState>,
-    palms: Query<(&HandBody, &Position, &Rotation), Without<Grabbable>>,
+    palms: Query<(&HandBody, &Position, &Rotation, &HandRay), Without<Grabbable>>,
     mut props: Query<
         (
             &Position,
@@ -365,10 +592,11 @@ fn drive_grabs(
             &ComputedMass,
             &ComputedAngularInertia,
             &Collider,
+            &RigidBody,
         ),
         With<Grabbable>,
     >,
-    prop_ids: Query<(Entity, &Position, &Rotation, &Collider), With<Grabbable>>,
+    prop_ids: Query<(Entity, &Position, &Rotation, &Collider, &RigidBody), With<Grabbable>>,
     mut rumble: MessageWriter<Rumble>,
 ) {
     let dt = time.delta_secs().max(1e-5);
@@ -378,19 +606,36 @@ fn drive_grabs(
         None => &hands,
     };
 
-    let mut palm_poses = [None; 2];
-    for (body, position, rotation) in &palms {
-        palm_poses[body.side.index()] = Some((position.0, rotation.0));
+    let mut palm_poses: [Option<(Vec3, Quat, HandRay)>; 2] = [None; 2];
+    for (body, position, rotation, ray) in &palms {
+        palm_poses[body.side.index()] = Some((position.0, rotation.0, *ray));
     }
 
     // --- Candidate selection (one prop per hand, nearest hand wins) ----------
     let prop_list = prop_snapshot(&prop_ids);
     let mut candidates = [None; 2];
+    let mut kinds = [GrabKind::Direct; 2];
     for side in [HandSide::Left, HandSide::Right] {
-        let Some((palm, _)) = palm_poses[side.index()] else {
+        let Some((palm, _, ray)) = palm_poses[side.index()] else {
             continue;
         };
-        candidates[side.index()] = candidate_for(palm, &prop_list);
+        let direct = candidate_for(palm, &prop_list);
+        let beam = beam_candidate(&ray, &prop_list);
+        match select_grab(
+            direct.map(|(_, distance)| distance),
+            beam.map(|(_, distance)| distance),
+            GRAB_RADIUS,
+        ) {
+            Some(GrabKind::Direct) => {
+                candidates[side.index()] = direct;
+                kinds[side.index()] = GrabKind::Direct;
+            }
+            Some(GrabKind::Beam) => {
+                candidates[side.index()] = beam;
+                kinds[side.index()] = GrabKind::Beam;
+            }
+            None => {}
+        }
     }
     let (mut left_candidate, mut right_candidate) =
         resolve_claims(candidates[0], candidates[1]);
@@ -419,7 +664,7 @@ fn drive_grabs(
         hand.prev_trigger = trigger;
         hand.push_velocity(hand_velocity, hand_spin);
 
-        let Some((palm, palm_rotation)) = palm_poses[side.index()] else {
+        let Some((palm, palm_rotation, ray)) = palm_poses[side.index()] else {
             continue;
         };
 
@@ -429,33 +674,61 @@ fn drive_grabs(
                 HandSide::Right => right_candidate,
             };
             if let Some(entity) = candidate {
-                if let Ok((position, rotation, _, _, _, _, collider)) = props.get(entity) {
-                    // Pull the prop into the palm over ~80 ms: its centre goes to the palm
-                    // surface on the palm side, so it reads as held instead of hovering
-                    // 12–14 cm away (DESIGN §7).
-                    let palm_normal = palm_rotation * Vec3::NEG_Y;
-                    let half_size = half_extent_along(collider, position.0, rotation.0, palm_normal);
-                    hand.held = Some(HeldProp {
-                        entity,
-                        offset: palm_rotation.inverse() * (position.0 - palm),
-                        grip: grip_offset(half_size),
-                        rotation_offset: palm_rotation.inverse() * rotation.0,
-                    });
+                if let Ok((position, rotation, _, _, _, _, collider, _)) = props.get(entity) {
+                    let hold = match kinds[side.index()] {
+                        GrabKind::Direct => {
+                            // Pull the prop into the palm over ~80 ms: its centre goes to the
+                            // palm surface on the palm side, so it reads as held instead of
+                            // hovering 12–14 cm away (DESIGN §7).
+                            let palm_normal = palm_rotation * Vec3::NEG_Y;
+                            let half_size =
+                                half_extent_along(collider, position.0, rotation.0, palm_normal);
+                            HoldKind::Direct {
+                                offset: palm_rotation.inverse() * (position.0 - palm),
+                                grip: grip_offset(half_size),
+                                rotation_offset: palm_rotation.inverse() * rotation.0,
+                            }
+                        }
+                        GrabKind::Beam => {
+                            // No positional jump: remember where on the prop the ray landed,
+                            // in the prop's own frame, and how far the beam point is.
+                            let Some(hit) = ray.hit.filter(|hit| hit.entity == entity) else {
+                                continue;
+                            };
+                            HoldKind::Beam {
+                                distance: hit.distance,
+                                local_offset: rotation.0.inverse() * (hit.point - position.0),
+                                hand_rotation: palm_rotation,
+                                prop_rotation: rotation.0,
+                            }
+                        }
+                    };
+                    hand.held = Some(HeldProp { entity, hold });
                     commands
                         .entity(entity)
                         .insert(SleepingDisabled)
                         .insert(held_collision_layers(side));
-                    let (strength, ms) = RUMBLE_GRAB;
+                    let (strength, ms) = match kinds[side.index()] {
+                        GrabKind::Direct => RUMBLE_GRAB,
+                        GrabKind::Beam => RUMBLE_BEAM,
+                    };
                     rumble.write(Rumble {
                         hand: rumble_hand(side),
                         strength,
                         ms,
                     });
-                    info!(
-                        "grab {:?}: prop {entity:?} at {:.3} m",
-                        side,
-                        (position.0 - palm).length()
-                    );
+                    match kinds[side.index()] {
+                        GrabKind::Direct => info!(
+                            "grab {:?}: prop {entity:?} at {:.3} m",
+                            side,
+                            (position.0 - palm).length()
+                        ),
+                        GrabKind::Beam => info!(
+                            "beam grab {:?}: prop {entity:?} at {:.3} m",
+                            side,
+                            ray.hit.map_or(0.0, |hit| hit.distance)
+                        ),
+                    }
                 }
             }
         }
@@ -463,22 +736,54 @@ fn drive_grabs(
         if hand.held.is_none() {
             continue;
         }
-        // Ease the capture offset into the palm (grip snap).
+        // Ease the capture offset into the palm (grip snap, direct only).
         if let Some(held) = hand.held.as_mut() {
-            let blend = 1.0 - (-dt / GRIP_SNAP_TAU).exp();
-            held.offset = held.offset.lerp(held.grip, blend);
+            if let HoldKind::Direct { offset, grip, .. } = &mut held.hold {
+                let blend = 1.0 - (-dt / GRIP_SNAP_TAU).exp();
+                *offset = offset.lerp(*grip, blend);
+            }
         }
-        let Some(held) = hand.held else {
+        let Some(mut held) = hand.held else {
             continue;
         };
 
+        // Push/pull a beam hold: left D-pad ↑/↓, right X/Y, or Q/E on the keyboard.
+        if let HoldKind::Beam { distance, .. } = &mut held.hold {
+            let mut axis = push_pull_axis(side, input.face);
+            if keys.pressed(KeyCode::KeyE) {
+                axis += 1.0; // away
+            }
+            if keys.pressed(KeyCode::KeyQ) {
+                axis -= 1.0; // closer
+            }
+            let axis = axis.clamp(-1.0, 1.0);
+            if axis != 0.0 {
+                *distance = adjust_hold_distance(*distance, axis, dt);
+            }
+        }
+        hand.held = Some(held);
+
         if just_released {
-            // Throw: the hand's recent velocity, gained and clamped.
-            let linear = throw_velocity(&hand.take_linear(), THROW_GAIN, THROW_MAX_SPEED);
-            let angular = throw_velocity(&hand.take_angular(), THROW_GAIN, THROW_MAX_SPIN);
+            let mut speed = 0.0;
             if let Ok((_, _, mut prop_linear, mut prop_angular, ..)) = props.get_mut(held.entity) {
-                prop_linear.0 = linear;
-                prop_angular.0 = angular;
+                match held.hold {
+                    HoldKind::Direct { .. } => {
+                        // Throw: the hand's recent velocity, gained and clamped.
+                        prop_linear.0 =
+                            throw_velocity(&hand.take_linear(), THROW_GAIN, THROW_MAX_SPEED);
+                        prop_angular.0 =
+                            throw_velocity(&hand.take_angular(), THROW_GAIN, THROW_MAX_SPIN);
+                    }
+                    HoldKind::Beam { .. } => {
+                        // Keep the velocity the beam built up (a wrist flick throws it), with
+                        // the same gain and clamps as a direct throw.
+                        prop_linear.0 =
+                            (prop_linear.0 * THROW_GAIN).clamp_length_max(THROW_MAX_SPEED);
+                        prop_angular.0 =
+                            (prop_angular.0 * THROW_GAIN).clamp_length_max(THROW_MAX_SPIN);
+                    }
+                }
+                speed = prop_linear.0.length();
             }
             commands
                 .entity(held.entity)
@@ -492,12 +797,12 @@ fn drive_grabs(
                 strength,
                 ms,
             });
-            info!("throw {:?}: {:.2} m/s", side, linear.length());
+            info!("throw {:?}: {speed:.2} m/s", side);
             continue;
         }
 
         // --- Force-limited velocity tracking --------------------------------
-        let Ok((position, rotation, mut linear, mut angular, mass, inertia, _)) =
+        let Ok((position, rotation, mut linear, mut angular, mass, inertia, _, _)) =
             props.get_mut(held.entity)
         else {
             // The prop disappeared: drop the grab.
@@ -505,10 +810,36 @@ fn drive_grabs(
             continue;
         };
 
-        let target_position = palm + palm_rotation * held.offset;
-        let target_rotation = (palm_rotation * held.rotation_offset).normalize();
+        let (target_position, target_rotation, target_velocity) = match held.hold {
+            HoldKind::Direct {
+                offset,
+                rotation_offset,
+                ..
+            } => (
+                palm + palm_rotation * offset,
+                (palm_rotation * rotation_offset).normalize(),
+                hand_velocity,
+            ),
+            HoldKind::Beam {
+                distance,
+                local_offset,
+                hand_rotation,
+                prop_rotation,
+            } => {
+                let anchor = beam_target(ray.origin, ray.direction, distance);
+                let target_position = anchor + rotation.0 * local_offset;
+                // Sweeping the hand moves the point at the end of a long ray much faster than
+                // the palm: feed that velocity forward so the spring tracks the sweep.
+                let target_velocity = hand_velocity + hand_spin.cross(anchor - ray.origin);
+                (
+                    target_position,
+                    beam_rotation(palm_rotation, hand_rotation, prop_rotation),
+                    target_velocity,
+                )
+            }
+        };
 
-        let desired_linear = (target_position - position.0) / dt + hand_velocity;
+        let desired_linear = (target_position - position.0) / dt + target_velocity;
         let mass = mass.value().max(1e-6);
         let max_delta_v = MAX_GRAB_FORCE / mass * dt;
         linear.0 = limited_velocity_step(linear.0, desired_linear, max_delta_v);
@@ -557,27 +888,29 @@ fn update_outlines(
     mut state: ResMut<GrabState>,
     materials: Res<OutlineMaterials>,
     mut assets: ResMut<Assets<StandardMaterial>>,
-    palms: Query<(&HandBody, &Position), Without<Grabbable>>,
-    props: Query<(Entity, &Position, &Rotation, &Collider), With<Grabbable>>,
+    palms: Query<(&HandBody, &Position, &HandRay), Without<Grabbable>>,
+    props: Query<(Entity, &Position, &Rotation, &Collider, &RigidBody), With<Grabbable>>,
     mut outlines: Query<(&GrabOutline, &ChildOf, &mut Visibility)>,
 ) {
     let dt = time.delta_secs();
     let mut palm_poses = [None; 2];
-    for (body, position) in &palms {
-        palm_poses[body.side.index()] = Some(position.0);
+    for (body, position, ray) in &palms {
+        palm_poses[body.side.index()] = Some((position.0, *ray));
     }
 
     let prop_list = prop_snapshot(&props);
     let mut candidates = [None; 2];
     for side in [HandSide::Left, HandSide::Right] {
-        let Some(palm) = palm_poses[side.index()] else {
+        let Some((palm, ray)) = palm_poses[side.index()] else {
             continue;
         };
         let hand = state.hand(side);
         if hand.held.is_some() || hand.fade.is_some() {
             continue;
         }
-        candidates[side.index()] = candidate_for(palm, &prop_list);
+        // Direct hover wins; otherwise the outline marks what the beam is aimed at.
+        candidates[side.index()] = candidate_for(palm, &prop_list)
+            .or_else(|| beam_candidate(&ray, &prop_list));
     }
     let (mut left_candidate, mut right_candidate) =
         resolve_claims(candidates[0], candidates[1]);
@@ -625,6 +958,114 @@ fn update_outlines(
         } else {
             Visibility::Hidden
         };
+    }
+}
+
+/// Place a unit-height cylinder (radius 0.5, height 1) between two points.
+fn segment_transform(transform: &mut Transform, from: Vec3, to: Vec3, radius: f32) -> bool {
+    let delta = to - from;
+    let length = delta.length();
+    if length < 1e-4 {
+        return false;
+    }
+    transform.translation = (from + to) * 0.5;
+    transform.rotation = Quat::from_rotation_arc(Vec3::Y, delta / length);
+    transform.scale = Vec3::new(radius * 2.0, length, radius * 2.0);
+    true
+}
+
+/// Draw each hand's beam (DESIGN §7.1): faint and thin while aiming at a grabbable prop,
+/// brighter and thicker while holding one, plus a dot on the hit point. The beam is the
+/// hand extended, so it uses that hand's colour and never becomes world decoration.
+fn update_beams(
+    state: Res<GrabState>,
+    materials: Res<BeamMaterials>,
+    mut assets: ResMut<Assets<StandardMaterial>>,
+    hands: Query<(&HandBody, &Position, &Rotation, &HandRay)>,
+    props: Query<(&Position, &Rotation), With<Grabbable>>,
+    mut visuals: Query<(&BeamVisual, &mut Transform, &mut Visibility)>,
+) {
+    let mut beams = [BeamPose::default(); 2];
+    for (body, position, _, ray) in &hands {
+        let side = body.side;
+        let beam = &mut beams[side.index()];
+        beam.origin = position.0;
+
+        if let Some(held) = state.hand(side).held {
+            // A direct grab keeps the M1 look; only a beam hold draws the beam.
+            if let HoldKind::Beam { local_offset, .. } = held.hold {
+                if let Ok((prop_position, prop_rotation)) = props.get(held.entity) {
+                    beam.visible = true;
+                    beam.holding = true;
+                    beam.end = held_point(prop_position.0, prop_rotation.0, local_offset);
+                }
+            }
+            continue;
+        }
+
+        let Some(hit) = ray.hit else {
+            continue;
+        };
+        // Idle aim: only when the ray lands on a grabbable prop the other hand isn't using.
+        if props.get(hit.entity).is_err() {
+            continue;
+        }
+        let other = match side {
+            HandSide::Left => HandSide::Right,
+            HandSide::Right => HandSide::Left,
+        };
+        if state
+            .hand(other)
+            .held
+            .is_some_and(|held| held.entity == hit.entity)
+        {
+            continue;
+        }
+        beam.visible = true;
+        beam.end = hit.point;
+    }
+
+    for side in [HandSide::Left, HandSide::Right] {
+        let beam = beams[side.index()];
+        let (alpha, glow) = if !beam.visible {
+            (0.0, 0.0)
+        } else if beam.holding {
+            (1.0, BEAM_GLOW_HOLD)
+        } else {
+            (BEAM_ALPHA_IDLE, BEAM_GLOW_IDLE)
+        };
+        let linear = materials.colors[side.index()].to_linear();
+        if let Some(mut material) = assets.get_mut(materials.handles[side.index()].id()) {
+            material.base_color = Color::srgba(0.0, 0.0, 0.0, alpha);
+            material.emissive = LinearRgba::rgb(
+                linear.red * glow,
+                linear.green * glow,
+                linear.blue * glow,
+            );
+        }
+    }
+
+    for (visual, mut transform, mut visibility) in &mut visuals {
+        let beam = beams[visual.side.index()];
+        if !beam.visible {
+            *visibility = Visibility::Hidden;
+            continue;
+        }
+        let (radius, dot_radius) = if beam.holding {
+            (BEAM_RADIUS_HOLD, BEAM_DOT_RADIUS_HOLD)
+        } else {
+            (BEAM_RADIUS_IDLE, BEAM_DOT_RADIUS_IDLE)
+        };
+        if visual.dot {
+            transform.translation = beam.end;
+            transform.rotation = Quat::IDENTITY;
+            transform.scale = Vec3::splat(dot_radius * 2.0);
+            *visibility = Visibility::Visible;
+        } else if segment_transform(&mut transform, beam.origin, beam.end, radius) {
+            *visibility = Visibility::Visible;
+        } else {
+            *visibility = Visibility::Hidden;
+        }
     }
 }
 
@@ -778,5 +1219,145 @@ mod tests {
                 "half extent {half_extent} got {thickness} m"
             );
         }
+    }
+
+    // --- M2d: palm beam ------------------------------------------------------
+
+    #[test]
+    fn direct_grab_wins_inside_the_palm_radius() {
+        assert_eq!(
+            select_grab(Some(0.05), Some(2.0), GRAB_RADIUS),
+            Some(GrabKind::Direct)
+        );
+        assert_eq!(
+            select_grab(Some(GRAB_RADIUS), Some(1.0), GRAB_RADIUS),
+            Some(GrabKind::Direct)
+        );
+    }
+
+    #[test]
+    fn beam_takes_over_outside_the_palm_radius() {
+        // Touching something just outside the radius is not a direct grab.
+        assert_eq!(
+            select_grab(Some(0.30), Some(2.0), GRAB_RADIUS),
+            Some(GrabKind::Beam)
+        );
+        assert_eq!(
+            select_grab(None, Some(2.0), GRAB_RADIUS),
+            Some(GrabKind::Beam)
+        );
+        assert_eq!(select_grab(Some(0.30), None, GRAB_RADIUS), None);
+        assert_eq!(select_grab(None, None, GRAB_RADIUS), None);
+    }
+
+    #[test]
+    fn beam_target_is_the_palm_plus_the_ray() {
+        let target = beam_target(Vec3::ZERO, Vec3::NEG_Z, 2.0);
+        assert!((target - Vec3::new(0.0, 0.0, -2.0)).length() < 1e-6);
+
+        // A non-unit direction must not stretch the hold distance.
+        let target = beam_target(Vec3::ZERO, Vec3::NEG_Z * 5.0, 2.0);
+        assert!((target - Vec3::new(0.0, 0.0, -2.0)).length() < 1e-6);
+
+        // Zero direction is harmless.
+        assert_eq!(beam_target(Vec3::ONE, Vec3::ZERO, 2.0), Vec3::ONE);
+    }
+
+    #[test]
+    fn push_pull_moves_at_the_tuned_speed() {
+        let away = adjust_hold_distance(2.0, 1.0, 1.0);
+        assert!((away - (2.0 + BEAM_PUSH_PULL_SPEED)).abs() < 1e-6);
+        let closer = adjust_hold_distance(2.0, -1.0, 0.5);
+        assert!((closer - (2.0 - BEAM_PUSH_PULL_SPEED * 0.5)).abs() < 1e-6);
+        // Diagonal/no input is not allowed to move it.
+        assert_eq!(adjust_hold_distance(2.0, 0.0, 0.5), 2.0);
+    }
+
+    #[test]
+    fn push_pull_clamps_to_the_beam_range() {
+        assert_eq!(
+            adjust_hold_distance(BEAM_MIN_DISTANCE, -1.0, 100.0),
+            BEAM_MIN_DISTANCE
+        );
+        assert_eq!(
+            adjust_hold_distance(BEAM_MAX_DISTANCE, 1.0, 100.0),
+            BEAM_MAX_DISTANCE
+        );
+        assert_eq!(
+            adjust_hold_distance(0.4, -5.0, 1.0),
+            BEAM_MIN_DISTANCE,
+            "the axis is clamped to [-1, 1] too"
+        );
+    }
+
+    #[test]
+    fn beam_rotation_is_the_wrist_delta_applied_to_the_prop() {
+        let hand_at_grab = Quat::from_rotation_x(0.2);
+        let prop_at_grab = Quat::from_rotation_z(-0.3);
+        let hand_now = Quat::from_rotation_y(0.7) * hand_at_grab;
+
+        let target = beam_rotation(hand_now, hand_at_grab, prop_at_grab);
+        let expected = hand_now * hand_at_grab.inverse() * prop_at_grab;
+        assert!(
+            target.dot(expected).abs() > 1.0 - 1e-5,
+            "delta rotation mismatch: {target:?} vs {expected:?}"
+        );
+
+        // A 90° wrist roll turns the prop exactly 90° around the same axis.
+        let target = beam_rotation(
+            Quat::from_rotation_z(core::f32::consts::FRAC_PI_2),
+            Quat::IDENTITY,
+            Quat::IDENTITY,
+        );
+        let rotated = target * Vec3::X;
+        assert!(
+            (rotated - Vec3::Y).length() < 1e-5,
+            "object X should end up on Y, got {rotated:?}"
+        );
+    }
+
+    #[test]
+    fn grabbed_point_follows_the_prop_rotation() {
+        let point = held_point(
+            Vec3::new(0.0, 1.0, 0.0),
+            Quat::from_rotation_y(core::f32::consts::FRAC_PI_2),
+            Vec3::new(1.0, 0.0, 0.0),
+        );
+        assert!((point - Vec3::new(0.0, 1.0, -1.0)).length() < 1e-5);
+    }
+
+    #[test]
+    fn push_pull_uses_free_face_buttons() {
+        use HandSide::{Left, Right};
+
+        assert_eq!(push_pull_axis(Left, [true, false, false, false]), 1.0);
+        assert_eq!(push_pull_axis(Left, [false, true, false, false]), -1.0);
+        assert_eq!(push_pull_axis(Right, [true, false, false, false]), 1.0);
+        assert_eq!(push_pull_axis(Right, [false, false, true, false]), -1.0);
+
+        // Right face[1] is B (jump) and must never move the beam.
+        assert_eq!(push_pull_axis(Right, [false, true, false, false]), 0.0);
+        // Both directions cancel out.
+        assert_eq!(push_pull_axis(Left, [true, true, false, false]), 0.0);
+    }
+
+    #[test]
+    fn beam_mesh_spans_its_two_endpoints() {
+        let mut transform = Transform::default();
+        assert!(segment_transform(
+            &mut transform,
+            Vec3::ZERO,
+            Vec3::new(0.0, 2.0, 0.0),
+            0.01
+        ));
+        assert!((transform.translation - Vec3::Y).length() < 1e-6);
+        assert!((transform.scale.y - 2.0).abs() < 1e-6);
+        assert!((transform.scale.x - 0.02).abs() < 1e-6);
+        assert!(!segment_transform(
+            &mut transform,
+            Vec3::ONE,
+            Vec3::ONE,
+            0.01
+        ));
     }
 }

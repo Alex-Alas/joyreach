@@ -176,7 +176,7 @@ fn setup_hud(mut commands: Commands, asset_server: Res<AssetServer>) {
             },
             BackgroundColor(theme::plate()),
             children![(
-                Text::new("Stick izq: moverse · Stick der: mirar · B: saltar · clic stick izq: agacharse · −/+: recentrar"),
+                Text::new("Stick izq: moverse · Stick der: mirar · ZL/ZR: agarrar · B: saltar · clic stick izq: agacharse · −/+: recentrar"),
                 TextFont {
                     font: asset_server.load(theme::FONT_MEDIUM).into(),
                     font_size: FontSize::Px(14.0),

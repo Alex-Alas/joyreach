@@ -7,6 +7,7 @@
 
 mod arms;
 mod grab;
+mod handray;
 mod hud;
 mod joycon;
 mod player;
@@ -15,7 +16,7 @@ mod world;
 
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured, save_to_disk};
-use bevy::window::{PresentMode, WindowPlugin, WindowResolution};
+use bevy::window::{PresentMode, WindowLevel, WindowPlugin, WindowResolution};
 use std::env;
 
 use joycon::Hands;
@@ -29,6 +30,7 @@ fn main() {
         }
     }
     let fake = env::var("JOYREACH_FAKE").is_ok_and(|value| value == "1");
+    let screenshot = screenshot_path.is_some();
 
     let mut app = App::new();
     app.add_plugins((
@@ -38,6 +40,14 @@ fn main() {
                 resolution: WindowResolution::new(1600, 900),
                 // Low input latency matters more than tearing here.
                 present_mode: PresentMode::AutoNoVsync,
+                // Screenshots only: a background/occluded window can lose its 3D pass
+                // (the HUD still draws), so keep the capture window above the terminal.
+                window_level: if screenshot {
+                    WindowLevel::AlwaysOnTop
+                } else {
+                    WindowLevel::Normal
+                },
+                focused: screenshot,
                 ..default()
             }),
             ..default()
@@ -45,6 +55,7 @@ fn main() {
         world::WorldPlugin,
         player::PlayerPlugin,
         arms::ArmsPlugin,
+        handray::HandRayPlugin,
         grab::GrabPlugin,
         hud::HudPlugin,
         joycon::JoyConPlugin,
@@ -76,9 +87,11 @@ fn main() {
 /// Also mirrored into [`FakeHands`] because the fixed-step physics reads input
 /// before `Update` runs and would otherwise never see the fake state.
 ///
-/// Script (so `--screenshot` at ~4 s catches a real grab):
-/// 0–1.5 s slow wave; 1.5–6 s both hands settle over the bench, the right one grabs
-/// a prop at 2.2 s; afterwards release and wave again.
+/// Script (so `--screenshot` at ~4 s catches a beam grab at distance):
+/// 0–0.6 s the fake player walks back (left stick) so the bench props are beyond the
+/// direct-grab radius; 0–1.5 s slow wave; 1.5–20 s both hands settle and aim at the bench,
+/// the right one beam-grabs a prop at 2.2 s, pushes the beam target out to ~2.3 m, and
+/// twists its wrist from 3.1 s so the held prop rotates for the shot.
 fn fake_hands(mut hands: ResMut<Hands>, mut fake: ResMut<FakeHands>, time: Res<Time>) {
     let t = time.elapsed_secs();
     for index in 0..2 {
@@ -102,28 +115,44 @@ fn fake_hands(mut hands: ResMut<Hands>, mut fake: ResMut<FakeHands>, time: Res<T
         // Trigger stays open during the wave phase so the demo prop is untouched.
         hand.trigger = false;
 
-        if (1.5..20.0).contains(&t) {
-            // Bench demo: hands turned in over the props, palm down-ish. The right
-            // hand closes on the nearest prop at 2.2 s and holds it through the shot.
-            let side_yaw: f32 = if index == 0 { 0.0 } else { 20.0 };
-            let micro = ((t * 1.3 + phase).sin() * 1.5).to_radians();
-            hand.orientation = Quat::from_euler(
-                EulerRot::YXZ,
-                (side_yaw.to_radians()) + micro,
-                5.0_f32.to_radians(),
-                0.0,
-            );
-            hand.trigger = index == 1 && t > 2.2;
-        } else if t >= 20.0 {
-            // Release (throw tick) after the demo and keep waving.
-            hand.trigger = ((t - 20.0 + index as f32 * 0.75) / 1.5) as i64 % 2 == 0;
-        }
-
+        // Defaults first: the bench script below opts back into the buttons it needs.
         hand.shoulder = false;
         hand.face = [false; 4];
         hand.stick = Vec2::ZERO;
         hand.stick_click = false;
         hand.menu = false;
+
+        // Walk backwards for the first 0.6 s: at the spawn the palm hovers on the bench
+        // props, so only from ~1.5 m away does the beam (not the direct grab) reach them.
+        if index == 0 && t < 0.6 {
+            hand.stick = Vec2::new(0.0, -1.0);
+        }
+
+        if (1.5..20.0).contains(&t) {
+            // Bench demo: hands turned in over the props. The right hand aims at the bench
+            // from afar and closes at 2.2 s; X then pushes the beam target out to ~2.3 m.
+            let micro = ((t * 1.3 + phase).sin() * 0.8).to_radians();
+            // The right palm sits ~1.15 m high and ~1.7 m from the props (tops ~1.05 m):
+            // −6° lands the ray on them instead of skimming over the bench.
+            // After the grab it tilts up to lift the prop clear of the bench for the shot.
+            let lift = ((t - 2.4) / 0.6).clamp(0.0, 1.0);
+            let pitch: f32 = if index == 0 { 5.0 } else { -6.0 + 16.0 * lift };
+            let roll = if index == 1 && t > 3.1 {
+                35.0_f32.to_radians() * ((t - 3.1) * 2.0).sin()
+            } else {
+                0.0
+            };
+            hand.orientation =
+                Quat::from_euler(EulerRot::YXZ, micro, pitch.to_radians(), roll);
+            hand.trigger = index == 1 && t > 2.2;
+            if index == 1 {
+                hand.face[0] = (2.45..3.1).contains(&t);
+            }
+        } else if t >= 20.0 {
+            // Release (throw tick) after the demo and keep waving.
+            hand.trigger = ((t - 20.0 + index as f32 * 0.75) / 1.5) as i64 % 2 == 0;
+        }
+
         hand.gyro = Vec3::ZERO;
         hand.accel = Vec3::new(0.0, 9.81, 0.0);
         // M2c: depth is opt-in. The fake demo must obey the same switch, otherwise the
