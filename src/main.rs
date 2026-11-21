@@ -101,10 +101,10 @@ fn fake_hands(mut hands: ResMut<Hands>, mut fake: ResMut<FakeHands>, time: Res<T
         // Trigger stays open during the wave phase so the demo prop is untouched.
         hand.trigger = false;
 
-        if (1.5..6.0).contains(&t) {
+        if (1.5..20.0).contains(&t) {
             // Bench demo: hands turned in over the props, palm down-ish. The right
-            // hand closes on the stone cylinder at 2.2 s and holds it for the shot.
-            let side_yaw: f32 = if index == 0 { 0.0 } else { -25.0 };
+            // hand closes on the nearest prop at 2.2 s and holds it through the shot.
+            let side_yaw: f32 = if index == 0 { 0.0 } else { 20.0 };
             let micro = ((t * 1.3 + phase).sin() * 1.5).to_radians();
             hand.orientation = Quat::from_euler(
                 EulerRot::YXZ,
@@ -113,9 +113,9 @@ fn fake_hands(mut hands: ResMut<Hands>, mut fake: ResMut<FakeHands>, time: Res<T
                 0.0,
             );
             hand.trigger = index == 1 && t > 2.2;
-        } else if t >= 6.0 {
-            // Release at 6 s (the throw tick) and keep waving.
-            hand.trigger = ((t - 6.0 + index as f32 * 0.75) / 1.5) as i64 % 2 == 0;
+        } else if t >= 20.0 {
+            // Release (throw tick) after the demo and keep waving.
+            hand.trigger = ((t - 20.0 + index as f32 * 0.75) / 1.5) as i64 % 2 == 0;
         }
 
         hand.shoulder = false;

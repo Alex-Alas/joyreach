@@ -359,7 +359,17 @@ fn drive_grabs(
         };
         candidates[side.index()] = candidate_for(palm, &prop_list);
     }
-    let (left_candidate, right_candidate) = resolve_claims(candidates[0], candidates[1]);
+    let (mut left_candidate, mut right_candidate) =
+        resolve_claims(candidates[0], candidates[1]);
+    // A prop already in the other hand cannot be grabbed again.
+    let held_left = state.hands[0].held.map(|held| held.entity);
+    let held_right = state.hands[1].held.map(|held| held.entity);
+    if left_candidate == held_right {
+        left_candidate = None;
+    }
+    if right_candidate == held_left {
+        right_candidate = None;
+    }
 
     // --- Edges and held-prop tracking ---------------------------------------
     for side in [HandSide::Left, HandSide::Right] {
@@ -522,7 +532,16 @@ fn update_outlines(
         }
         candidates[side.index()] = candidate_for(palm, &prop_list);
     }
-    let (left_candidate, right_candidate) = resolve_claims(candidates[0], candidates[1]);
+    let (mut left_candidate, mut right_candidate) =
+        resolve_claims(candidates[0], candidates[1]);
+    let held_left = state.hands[0].held.map(|held| held.entity);
+    let held_right = state.hands[1].held.map(|held| held.entity);
+    if left_candidate == held_right {
+        left_candidate = None;
+    }
+    if right_candidate == held_left {
+        right_candidate = None;
+    }
 
     let mut wanted = [None; 2];
     let mut alpha = [1.0_f32; 2];
