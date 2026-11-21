@@ -1066,11 +1066,21 @@ const ACCEL_KP: f32 = 2.0;
 /// Only trust the accelerometer for tilt when |a| is within this band of 1 g (linear acceleration
 /// during a swing would otherwise tilt the estimate).
 const ACCEL_TRUST_BAND: f32 = 1.5;
-/// "Still" threshold for slow gyro-bias re-estimation.
-const GYRO_STILL_EPS: f32 = 0.03;
-const GYRO_STILL_NS: u64 = 500_000_000;
-/// Samples above this while calibrating are considered motion and excluded from the average.
-const BIAS_INIT_MAX_GYRO: f32 = 0.5;
+/// Gyro bias = mean of the raw gyro over "still" windows (GamepadMotionHelpers-style). Stillness
+/// is judged by how little the raw gyro/accel VARY inside a window, not by |gyro - bias|: the old
+/// magnitude gate deadlocked whenever the first estimate was off by more than its threshold (e.g.
+/// the hand moved during the first second), and the hand then drifted in yaw forever.
+const STILL_WINDOW_NS: u64 = 400_000_000;
+/// Max std dev inside a still window. Measured scale: on a table ~0.002 rad/s / ~0.02 m/s²;
+/// a hand holding still ~0.005-0.02 rad/s / ~0.05-0.15 m/s².
+const STILL_GYRO_STD: f32 = 0.02;
+const STILL_ACCEL_STD: f32 = 0.25;
+/// A steady window whose mean is this far from the bias is a slow real turn, not bias
+/// (Joy-Con residual bias after factory calibration is ~0.01-0.05 rad/s).
+const BIAS_MAX_CORRECTION: f32 = 0.15;
+/// Blend per still window after the first one (0.4 s windows => ~1.2 s time constant).
+const BIAS_BLEND: f32 = 0.3;
+/// Start integrating this long after connect even if no still window was seen yet.
 const BIAS_INIT_NS: u64 = 1_000_000_000;
 /// Ignore gaps longer than this (BT stall / reconnect): no integration for that step.
 const DT_MAX_NS: u64 = 50_000_000;
@@ -1091,12 +1101,16 @@ struct ImuFusion {
     /// Gyro bias in body space (rad/s).
     bias: Vec3,
     bias_ready: bool,
+    /// At least one still window has set `bias`.
+    bias_calibrated: bool,
     bias_start_ts: Option<u64>,
-    bias_sum: Vec3,
-    bias_n: u32,
-    still_since: Option<u64>,
-    still_sum: Vec3,
-    still_n: u32,
+    /// Running sums of the current stillness window (raw body-space gyro/accel).
+    win_start: Option<u64>,
+    win_n: u32,
+    win_g: Vec3,
+    win_g2: Vec3,
+    win_a: Vec3,
+    win_a2: Vec3,
     last_ts: Option<u64>,
     samples: u32,
     auto_recentered: bool,
@@ -1112,12 +1126,14 @@ impl ImuFusion {
             yaw_offset: Quat::IDENTITY,
             bias: Vec3::ZERO,
             bias_ready: false,
+            bias_calibrated: false,
             bias_start_ts: None,
-            bias_sum: Vec3::ZERO,
-            bias_n: 0,
-            still_since: None,
-            still_sum: Vec3::ZERO,
-            still_n: 0,
+            win_start: None,
+            win_n: 0,
+            win_g: Vec3::ZERO,
+            win_g2: Vec3::ZERO,
+            win_a: Vec3::ZERO,
+            win_a2: Vec3::ZERO,
             last_ts: None,
             samples: 0,
             auto_recentered: false,
@@ -1150,7 +1166,7 @@ impl ImuFusion {
         };
         self.last_ts = Some(ts_ns);
 
-        self.update_bias(gyro, ts_ns);
+        self.update_bias(gyro, accel, ts_ns);
 
         let Some(dt) = dt else {
             // First sample, duplicate timestamp, or a >50 ms gap: resync and integrate nothing.
@@ -1192,47 +1208,55 @@ impl ImuFusion {
         }
     }
 
-    fn update_bias(&mut self, gyro: Vec3, ts_ns: u64) {
-        if !self.bias_ready {
-            let start = *self.bias_start_ts.get_or_insert(ts_ns);
-            if gyro.length() < BIAS_INIT_MAX_GYRO {
-                self.bias_sum += gyro;
-                self.bias_n += 1;
-            }
-            if ts_ns.saturating_sub(start) >= BIAS_INIT_NS {
-                if self.bias_n >= 10 {
-                    self.bias = self.bias_sum / self.bias_n as f32;
-                    eprintln!(
-                        "[joycon] gyro bias calibrated: |{:.4}| rad/s over {} samples",
-                        self.bias.length(),
-                        self.bias_n
-                    );
-                }
-                // Even if the user was moving, start integrating: the still-based re-estimation
-                // below fixes the bias as soon as the Joy-Con settles.
-                self.bias_ready = true;
-            }
+    fn update_bias(&mut self, gyro: Vec3, accel: Vec3, ts_ns: u64) {
+        let connect = *self.bias_start_ts.get_or_insert(ts_ns);
+        if !self.bias_ready && ts_ns.saturating_sub(connect) >= BIAS_INIT_NS {
+            // Held in hand at connect and never still yet: integrate with bias 0; the first
+            // still window below fixes it as soon as the Joy-Con settles.
+            self.bias_ready = true;
+        }
+
+        let start = *self.win_start.get_or_insert(ts_ns);
+        self.win_n += 1;
+        self.win_g += gyro;
+        self.win_g2 += gyro * gyro;
+        self.win_a += accel;
+        self.win_a2 += accel * accel;
+        if ts_ns.saturating_sub(start) < STILL_WINDOW_NS {
             return;
         }
 
-        // Slow, quiet-only re-estimation: after 0.5 s under the still threshold, blend the
-        // window average into the bias by 5% (per window).
-        if (gyro - self.bias).length() < GYRO_STILL_EPS {
-            let still_since = *self.still_since.get_or_insert(ts_ns);
-            self.still_sum += gyro;
-            self.still_n += 1;
-            if ts_ns.saturating_sub(still_since) >= GYRO_STILL_NS && self.still_n >= 20 {
-                let avg = self.still_sum / self.still_n as f32;
-                self.bias = self.bias * 0.95 + avg * 0.05;
-                self.still_since = Some(ts_ns);
-                self.still_sum = Vec3::ZERO;
-                self.still_n = 0;
+        let n = self.win_n as f32;
+        // Std dev of a 3-vector signal: sqrt of the summed per-axis variances.
+        let std = |sum: Vec3, sum2: Vec3| {
+            let mean = sum / n;
+            (sum2 / n - mean * mean).max(Vec3::ZERO).element_sum().sqrt()
+        };
+        let mean_g = self.win_g / n;
+        let still = self.win_n >= 20
+            && std(self.win_g, self.win_g2) < STILL_GYRO_STD
+            && std(self.win_a, self.win_a2) < STILL_ACCEL_STD
+            && (mean_g - self.bias).length() < BIAS_MAX_CORRECTION;
+        if still {
+            let blend = if self.bias_calibrated { BIAS_BLEND } else { 1.0 };
+            self.bias = self.bias.lerp(mean_g, blend);
+            if !self.bias_calibrated {
+                eprintln!(
+                    "[joycon] gyro bias calibrated: |{:.4}| rad/s over {} samples",
+                    self.bias.length(),
+                    self.win_n
+                );
             }
-        } else {
-            self.still_since = None;
-            self.still_sum = Vec3::ZERO;
-            self.still_n = 0;
+            self.bias_calibrated = true;
+            self.bias_ready = true;
         }
+
+        self.win_start = None;
+        self.win_n = 0;
+        self.win_g = Vec3::ZERO;
+        self.win_g2 = Vec3::ZERO;
+        self.win_a = Vec3::ZERO;
+        self.win_a2 = Vec3::ZERO;
     }
 
     fn maybe_auto_recenter(&mut self, accel: Vec3) {
@@ -1530,5 +1554,44 @@ mod tests {
             ts + 5_000_000,
         );
         assert!(fusion.q.angle_between(q_before).to_degrees() > 0.1);
+    }
+
+    /// Regression for "the left hand drifts left on its own": a wrong first bias (the hand moved
+    /// while connecting) must be corrected as soon as the Joy-Con rests, then yaw must hold.
+    #[test]
+    fn wrong_initial_bias_self_corrects_at_rest() {
+        let true_bias = Vec3::new(0.0, 0.05, 0.0); // ~2.9 deg/s of yaw drift if uncorrected
+        let up = Vec3::Y * GRAVITY;
+        let mut fusion = ImuFusion::new();
+        let mut ts = 0u64;
+        // 1.2 s of wobbly handling at connect: never still, integration starts with bias 0.
+        for i in 0..240 {
+            let wobble = Vec3::new(0.0, if i % 20 < 10 { 0.4 } else { -0.4 }, 0.0);
+            feed(&mut fusion, true_bias + wobble, up, &mut ts, 1);
+        }
+        assert!(fusion.bias_ready);
+        // Then it rests (with sensor noise well under the stillness threshold).
+        for i in 0..600 {
+            let noise = Vec3::new(0.0, if i % 2 == 0 { 0.003 } else { -0.003 }, 0.0);
+            feed(&mut fusion, true_bias + noise, up, &mut ts, 1);
+        }
+        assert_vec3(fusion.bias, true_bias, 0.005);
+        // Once corrected, 10 s at rest drifts < 2 deg of yaw.
+        let q0 = fusion.q;
+        feed(&mut fusion, true_bias, up, &mut ts, 2000);
+        let drift = fusion.q.angle_between(q0).to_degrees();
+        assert!(drift < 2.0, "yaw drifted {drift} deg in 10 s at rest");
+    }
+
+    /// A smooth real turn is steady too, but too fast to be bias: it must not be absorbed.
+    #[test]
+    fn steady_slow_turn_is_not_absorbed_as_bias() {
+        let mut fusion = ImuFusion::new();
+        let mut ts = 0u64;
+        feed(&mut fusion, Vec3::ZERO, Vec3::Y * GRAVITY, &mut ts, 220);
+        feed(&mut fusion, Vec3::Y * 0.3, Vec3::Y * GRAVITY, &mut ts, 400); // 2 s at 0.3 rad/s
+        assert_vec3(fusion.bias, Vec3::ZERO, 1e-4);
+        let yaw = fusion.q.to_euler(EulerRot::YXZ).0;
+        assert!((yaw - 0.6).abs() < 0.02, "expected 0.6 rad of yaw, got {yaw}");
     }
 }
